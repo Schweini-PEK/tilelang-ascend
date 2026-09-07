@@ -100,8 +100,8 @@ def _sort_kernel(N, N_aligned, dtype="float"):
 
     @T.prim_func
     def main(
-            scores: T.Tensor((N,), dtype),
-            sort_idx_out: T.Tensor((N,), dtype),
+        scores: T.Tensor((N,), dtype),
+        sort_idx_out: T.Tensor((N,), dtype),
     ):
         with T.Kernel(1, is_npu=True) as (cid, vid):
             scores_ub = T.alloc_ub((N_aligned,), dtype)
@@ -131,13 +131,13 @@ def _gather_kernel(N, dtype="float"):
 
     @T.prim_func
     def main(
-            # boxes is passed as the original [N, 4] torch tensor; the kernel
-            # declares a FLAT [N*4] view over the same GM bytes (the gm2ub
-            # lowering of a 2D->1D flatten copy computes a non-zero row stride
-            # and lands OOB; a 1D->1D full copy is the validated pattern).
-            boxes: T.Tensor((N * 4,), dtype),
-            sort_idx: T.Tensor((N,), dtype),
-            coords: T.Tensor((4, N), dtype),
+        # boxes is passed as the original [N, 4] torch tensor; the kernel
+        # declares a FLAT [N*4] view over the same GM bytes (the gm2ub
+        # lowering of a 2D->1D flatten copy computes a non-zero row stride
+        # and lands OOB; a 1D->1D full copy is the validated pattern).
+        boxes: T.Tensor((N * 4,), dtype),
+        sort_idx: T.Tensor((N,), dtype),
+        coords: T.Tensor((4, N), dtype),
     ):
         with T.Kernel(1, is_npu=True) as (cid, vid):
             # gather source must be a FLAT 1D buffer — a multi-row 2D src
@@ -155,7 +155,7 @@ def _gather_kernel(N, dtype="float"):
             # iteration c's MTE3 GM write via per-slot v<->mte3 flags.
             # Manually unrolled x4 so slot indices stay compile-time consts.
             outw2 = T.alloc_ub((2, N_pad), dtype)
-            T.copy(boxes[0:N * 4], tab[0:N * 4])
+            T.copy(boxes[0 : N * 4], tab[0 : N * 4])
             T.copy(sort_idx[0:N], idx_ub[0:N])
             T.barrier_all()  # MTE2 -> V
             T.set_flag("mte3", "v", 0)  # both slots writable
@@ -224,8 +224,8 @@ def _iou_bitmap_kernel(N, BM, BN, NCG, NRB, N_pad_rows, NW16, thr, dtype="float"
 
     @T.prim_func
     def main(
-            coords: T.Tensor((4, N), dtype),
-            bitmap: T.Tensor((N_pad_rows, NW16), "uint16"),
+        coords: T.Tensor((4, N), dtype),
+        bitmap: T.Tensor((N_pad_rows, NW16), "uint16"),
     ):
         with T.Kernel(NRB * NCG, is_npu=True, threads=1) as cid:
             bx = cid // NCG
@@ -252,14 +252,14 @@ def _iou_bitmap_kernel(N, BM, BN, NCG, NRB, N_pad_rows, NW16, thr, dtype="float"
             # skip strictly-lower-triangle blocks (garbage is provably
             # harmless: greedy only consumes entries with j > k)
             if bx * BM < (by + 1) * BN:
-                T.copy(coords[0, by * BN:by * BN + BN], x1_j, pad_value=0.0)
-                T.copy(coords[1, by * BN:by * BN + BN], y1_j, pad_value=0.0)
-                T.copy(coords[2, by * BN:by * BN + BN], x2_j, pad_value=0.0)
-                T.copy(coords[3, by * BN:by * BN + BN], y2_j, pad_value=0.0)
-                T.copy(coords[0, bx * BM:bx * BM + BM], x1_i, pad_value=0.0)
-                T.copy(coords[1, bx * BM:bx * BM + BM], y1_i, pad_value=0.0)
-                T.copy(coords[2, bx * BM:bx * BM + BM], x2_i, pad_value=0.0)
-                T.copy(coords[3, bx * BM:bx * BM + BM], y2_i, pad_value=0.0)
+                T.copy(coords[0, by * BN : by * BN + BN], x1_j, pad_value=0.0)
+                T.copy(coords[1, by * BN : by * BN + BN], y1_j, pad_value=0.0)
+                T.copy(coords[2, by * BN : by * BN + BN], x2_j, pad_value=0.0)
+                T.copy(coords[3, by * BN : by * BN + BN], y2_j, pad_value=0.0)
+                T.copy(coords[0, bx * BM : bx * BM + BM], x1_i, pad_value=0.0)
+                T.copy(coords[1, bx * BM : bx * BM + BM], y1_i, pad_value=0.0)
+                T.copy(coords[2, bx * BM : bx * BM + BM], x2_i, pad_value=0.0)
+                T.copy(coords[3, bx * BM : bx * BM + BM], y2_i, pad_value=0.0)
                 T.barrier_all()  # MTE2 -> V
                 # areas, bit-exact order (x2-x1)*(y2-y1)
                 T.tile.sub(w, x2_j, x1_j)
@@ -294,8 +294,8 @@ def _iou_bitmap_kernel(N, BM, BN, NCG, NRB, N_pad_rows, NW16, thr, dtype="float"
                 T.copy(
                     cmp16,
                     bitmap[
-                        bx * BM:bx * BM + BM,
-                        by * CMP16:by * CMP16 + CMP16,
+                        bx * BM : bx * BM + BM,
+                        by * CMP16 : by * CMP16 + CMP16,
                     ],
                 )
 
@@ -318,9 +318,9 @@ def _greedy_kernel(N, N_pad_rows, B, NB, NW16, dtype="float"):
 
     @T.prim_func
     def main(
-            bitmap: T.Tensor((N_pad_rows, NW16), "uint16"),
-            idx: T.Tensor((N,), dtype),
-            out: T.Tensor((N + 1,), dtype),
+        bitmap: T.Tensor((N_pad_rows, NW16), "uint16"),
+        idx: T.Tensor((N,), dtype),
+        out: T.Tensor((N + 1,), dtype),
     ):
         with T.Kernel(1, is_npu=True) as (cid, vid):
             keepmask = T.alloc_ub((NW16,), "uint16")
@@ -334,7 +334,7 @@ def _greedy_kernel(N, N_pad_rows, B, NB, NW16, dtype="float"):
             T.tile.fill(cnt, 0.0)
             T.barrier_all()  # MTE2/V -> S (decisions read keepmask bits)
             for c in T.serial(NB):
-                T.copy(bitmap[c * B:(c + 1) * B, 0:NW16], chunk)
+                T.copy(bitmap[c * B : (c + 1) * B, 0:NW16], chunk)
                 T.barrier_all()  # MTE2 -> V/S
                 # word-major fast path: a zero keepmask word means all 16
                 # boxes are already suppressed — bitwise_and only CLEARS
@@ -363,7 +363,7 @@ def _greedy_kernel(N, N_pad_rows, B, NB, NW16, dtype="float"):
                 T.barrier_all()  # V -> MTE2 (next batch chunk DMA)
             T.barrier_all()  # S -> MTE3
             T.copy(kept[0:N], out[0:N])
-            T.copy(cnt, out[N:N + 1])
+            T.copy(cnt, out[N : N + 1])
 
     return main
 
@@ -379,28 +379,21 @@ def nms(boxes: torch.Tensor, scores: torch.Tensor, iou_threshold: float):
     if boxes.dim() != 2 or boxes.shape[1] != 4:
         raise ValueError(f"nms: boxes must be [N, 4], got shape {tuple(boxes.shape)}")
     if scores.dim() != 1 or scores.shape[0] != boxes.shape[0]:
-        raise ValueError(
-            f"nms: scores must be [N] with N=boxes.shape[0], got shape {tuple(scores.shape)} vs boxes {tuple(boxes.shape)}"
-        )
+        raise ValueError(f"nms: scores must be [N] with N=boxes.shape[0], got shape {tuple(scores.shape)} vs boxes {tuple(boxes.shape)}")
     if boxes.dtype != torch.float32 or scores.dtype != torch.float32:
-        raise TypeError(
-            f"nms: boxes/scores must be float32, got boxes={boxes.dtype}, scores={scores.dtype}")
+        raise TypeError(f"nms: boxes/scores must be float32, got boxes={boxes.dtype}, scores={scores.dtype}")
     if not boxes.is_contiguous() or not scores.is_contiguous():
         raise ValueError("nms: boxes/scores must be contiguous tensors")
     if not isinstance(iou_threshold, (int, float)):
-        raise ValueError(
-            f"nms: iou_threshold must be a Python number, got {type(iou_threshold).__name__}")
+        raise ValueError(f"nms: iou_threshold must be a Python number, got {type(iou_threshold).__name__}")
     if not (0.0 < iou_threshold < 1.0):
-        raise ValueError(
-            f"nms: iou_threshold must be in the open interval (0, 1), got {iou_threshold}")
+        raise ValueError(f"nms: iou_threshold must be in the open interval (0, 1), got {iou_threshold}")
 
     N = boxes.shape[0]
     if N == 0:
         return boxes[0:0, 0]
     if N > _MAX_N:
-        raise ValueError(
-            f"nms: N={N} exceeds supported maximum {_MAX_N} (greedy bitmap chunk would exceed the 192KB UB budget)"
-        )
+        raise ValueError(f"nms: N={N} exceeds supported maximum {_MAX_N} (greedy bitmap chunk would exceed the 192KB UB budget)")
 
     tp = _tiling(N)
 
@@ -415,8 +408,7 @@ def nms(boxes: torch.Tensor, scores: torch.Tensor, iou_threshold: float):
 
     key3 = (N, iou_threshold)
     if key3 not in _iou_cache:
-        _iou_cache[key3] = _iou_bitmap_kernel(N, tp["BM"], tp["BN"], tp["NCG"], tp["NRB"],
-                                              tp["N_pad_rows"], tp["NW16"], iou_threshold)
+        _iou_cache[key3] = _iou_bitmap_kernel(N, tp["BM"], tp["BN"], tp["NCG"], tp["NRB"], tp["N_pad_rows"], tp["NW16"], iou_threshold)
     bitmap = _iou_cache[key3](coords)
 
     if key not in _greedy_cache:
@@ -546,11 +538,8 @@ def _run_case(name, N, thr, boxes_vr, scores_vr, seed, level="cann-bench"):
     tag = "PRECISION_PASS" if match else "PRECISION_FAIL"
     extra = ""
     if not match:
-        extra = f" reason=length golden={ref.numel()} cand={out.numel()}" if out.numel(
-        ) != ref.numel() else " reason=index mismatch"
-    print(
-        f"[{tag}] {level} {name} N={N} thr={thr} M_golden={ref.numel()} M_candidate={out.numel()}{extra}"
-    )
+        extra = f" reason=length golden={ref.numel()} cand={out.numel()}" if out.numel() != ref.numel() else " reason=index mismatch"
+    print(f"[{tag}] {level} {name} N={N} thr={thr} M_golden={ref.numel()} M_candidate={out.numel()}{extra}")
     return match
 
 
