@@ -172,7 +172,7 @@ def _gather_kernel(N, dtype="float"):
             T.tile.mul(offi, offi, 16)
             T.tile.add(offi, offi, 0)
             T.reinterpretcast(offv0, offi, "uint32_t")
-            T.tile.gather(outw2[0, 0:N], tab, offv0, 0)
+            T.tile.gather(outw2[0, :N], tab, offv0, 0)
             T.set_flag("v", "mte3", 0)
             T.wait_flag("v", "mte3", 0)
             T.copy(outw2[0, 0:N], coords[0, 0:N])
@@ -183,7 +183,7 @@ def _gather_kernel(N, dtype="float"):
             T.tile.mul(offi, offi, 16)
             T.tile.add(offi, offi, 4)
             T.reinterpretcast(offv1, offi, "uint32_t")
-            T.tile.gather(outw2[1, 0:N], tab, offv1, 0)
+            T.tile.gather(outw2[1, :N], tab, offv1, 0)
             T.set_flag("v", "mte3", 1)
             T.wait_flag("v", "mte3", 1)
             T.copy(outw2[1, 0:N], coords[1, 0:N])
@@ -194,7 +194,7 @@ def _gather_kernel(N, dtype="float"):
             T.tile.mul(offi, offi, 16)
             T.tile.add(offi, offi, 8)
             T.reinterpretcast(offv2, offi, "uint32_t")
-            T.tile.gather(outw2[0, 0:N], tab, offv2, 0)
+            T.tile.gather(outw2[0, :N], tab, offv2, 0)
             T.set_flag("v", "mte3", 0)
             T.wait_flag("v", "mte3", 0)
             T.copy(outw2[0, 0:N], coords[2, 0:N])
@@ -205,7 +205,7 @@ def _gather_kernel(N, dtype="float"):
             T.tile.mul(offi, offi, 16)
             T.tile.add(offi, offi, 12)
             T.reinterpretcast(offv3, offi, "uint32_t")
-            T.tile.gather(outw2[1, 0:N], tab, offv3, 0)
+            T.tile.gather(outw2[1, :N], tab, offv3, 0)
             T.set_flag("v", "mte3", 1)
             T.wait_flag("v", "mte3", 1)
             T.copy(outw2[1, 0:N], coords[3, 0:N])
@@ -294,7 +294,7 @@ def _iou_bitmap_kernel(N, BM, BN, NCG, NRB, N_pad_rows, NW16, thr, dtype="float"
                     T.tile.add(u, u, 1e-6)
                     T.tile.div(tmp, tmp, u)
                     # pack keep-bits (iou <= thr) directly into the row region
-                    T.tile.compare(cmpb[k, 0:CMPB], tmp, thr, "LE")
+                    T.tile.compare(cmpb[k, :CMPB], tmp, thr, "LE")
                 T.barrier_all()  # V -> MTE3
                 T.reinterpretcast(cmp16, cmpb, "uint16_t")
                 T.copy(
@@ -361,7 +361,7 @@ def _greedy_kernel(N, N_pad_rows, B, NB, NW16, dtype="float"):
                                 if bit == 1:
                                     # cross/in-batch keepmask AND (full row;
                                     # garbage bits only land on decided cols)
-                                    T.tile.bitwise_and(keepmask, keepmask, chunk[k, 0:NW16])
+                                    T.tile.bitwise_and(keepmask, keepmask, chunk[k, :NW16])
                                     T.barrier_all()  # V -> S (next decision)
                                     kc = T.cast(cnt[0], "int32")
                                     kept[kc] = idx_ub[kk]
