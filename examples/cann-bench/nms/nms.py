@@ -1,17 +1,25 @@
-"""NMS (Non-Maximum Suppression) example — greedy NMS with cann-bench 20 cases.
+# ----------------------------------------------------------------------------
+# Copyright (c) 2026 Huawei Technologies Co., Ltd.
+# This program is free software, you can redistribute it and/or modify it under
+# the terms of the CANN Open Software License Agreement Version 2.0 (the
+# "License"). You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY
+# KIND, EITHER EXPRESS OR IMPLIED.
+# ----------------------------------------------------------------------------
 
-Sort-bitmap NMS pipeline for Ascend NPU (Expert mode). Targets cann-bench
-multi-case evaluation: sort scores descending, reorder boxes, pack pairwise
-IoU threshold decisions into a uint16 bitmap, then run a blocked greedy
-bit-scan. Output keep indices match the torch golden exactly (index list
-equality, not tolerance).
+"""NMS (Non-Maximum Suppression) TileLang kernel — greedy NMS (Expert mode).
+
+Sort-bitmap NMS pipeline for Ascend NPU. Sort scores descending, reorder
+boxes, pack pairwise IoU threshold decisions into a uint16 bitmap, then run
+a blocked greedy bit-scan. Output keep indices match the torch golden
+exactly (index list equality, not tolerance).
 
 Algorithm:
     keep = NMS(boxes, scores, iou_threshold)
     IoU(i, j) = inter / (area_i + area_j - inter + 1e-6)
     suppress when ~(iou <= thr)  (NaN IoU suppresses, matching golden)
 
-Reference: pure-PyTorch greedy NMS (see golden_nms below)
+Reference: pure-PyTorch greedy NMS (golden_nms in test_nms.py)
 
 Key design points:
 - 4-kernel pipeline: sort -> vectorized gather -> IoU bitmap -> greedy bit-scan
@@ -28,11 +36,9 @@ Key design points:
   indices stay compile-time constants; flag tokens closed by a teardown wait)
 - Tail blocks handled by T.copy pad_value + an affine loop bound (no manual
   host-side padding)
-"""
 
-import argparse
-import gc
-import sys
+Interface: nms(boxes, scores, iou_threshold) -> keep_indices
+"""
 
 import torch
 
@@ -418,319 +424,3 @@ def nms(boxes: torch.Tensor, scores: torch.Tensor, iou_threshold: float):
     M = int(out[N].item())  # 4B scalar D2H (whitelisted)
     out.resize_(M)  # metadata shrink only
     return out
-
-
-# ========== Golden Reference ==========
-def golden_nms(boxes, scores, iou_threshold):
-    """Golden NMS: full IoU matrix vectorized, greedy selection on CPU.
-
-    Uses ~(iou <= thr) so NaN/inf IoU suppress (IEEE: NaN <= thr is False).
-    """
-    assert boxes.dim() == 2 and boxes.shape[1] == 4, "boxes shape must be [N, 4]"
-    assert scores.dim() == 1 and scores.shape[0] == boxes.shape[0], "scores shape must be [N]"
-
-    n = scores.shape[0]
-    dev = boxes.device
-    areas = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
-
-    x1 = torch.maximum(boxes[:, None, 0], boxes[None, :, 0])
-    y1 = torch.maximum(boxes[:, None, 1], boxes[None, :, 1])
-    x2 = torch.minimum(boxes[:, None, 2], boxes[None, :, 2])
-    y2 = torch.minimum(boxes[:, None, 3], boxes[None, :, 3])
-    inter = (x2 - x1).clamp(min=0) * (y2 - y1).clamp(min=0)
-    iou = inter / (areas[:, None] + areas[None, :] - inter + 1e-6)
-
-    _, order = scores.sort(descending=True)
-
-    iou_cpu = iou.cpu()
-    order_cpu = order.cpu()
-    suppressed = torch.zeros(n, dtype=torch.bool)
-    keep = []
-    for idx_t in order_cpu:
-        idx = int(idx_t)
-        if suppressed[idx]:
-            continue
-        keep.append(idx)
-        suppressed |= ~(iou_cpu[idx] <= iou_threshold)
-
-    return torch.tensor(keep, dtype=torch.long, device=dev)
-
-
-def get_input(boxes, scores, iou_threshold=0.5, **kwargs):
-    """Regularize inputs (cann-bench harness semantics, applied to both
-    golden and candidate sides):
-    1. sort x-pair / y-pair per box (x1<=x2, y1<=y2; idempotent on legal
-       boxes — value_range sampling otherwise yields degenerate boxes)
-    2. replace tied scores with a deterministic distinct sequence (seed=0)
-       so greedy tie-break order is well-defined.
-    """
-    x1 = torch.minimum(boxes[:, 0], boxes[:, 2])
-    x2 = torch.maximum(boxes[:, 0], boxes[:, 2])
-    y1 = torch.minimum(boxes[:, 1], boxes[:, 3])
-    y2 = torch.maximum(boxes[:, 1], boxes[:, 3])
-    boxes = torch.stack([x1, y1, x2, y2], dim=1)
-
-    n = int(scores.shape[0])
-    if n > 1 and int(scores.reshape(-1).unique().numel()) < n:
-        g = torch.Generator().manual_seed(0)
-        ranks = (torch.randperm(n, generator=g) + 1).to(torch.float32) / float(n)
-        scores = ranks.reshape(scores.shape).to(dtype=scores.dtype, device=scores.device)
-    return [boxes, scores]
-
-
-# ========== Input Generation (matches the eval framework's DataGenerator) ==========
-SEED_BASE = 1000  # torch.manual_seed(SEED_BASE + case_id)
-
-
-def _gen_tensor(shape, value_range, seed):
-    """Generate a fp32 tensor: uniform in value_range, or special recipes
-    for inf (finite base + boundary slices filled -inf/+inf), nan (~50% NaN
-    mixed with finite), and constant ranges."""
-    min_val, max_val = value_range
-    gen = torch.Generator()
-    gen.manual_seed(seed)
-    dtype = torch.float32
-
-    if min_val != min_val:  # NaN range: mix NaN with random finite values
-        rand_base = torch.rand(shape, dtype=torch.float32, generator=gen)
-        tensor = (rand_base * 2 - 1).to(dtype)
-        nan_rand = torch.rand(shape, dtype=torch.float32, generator=gen)
-        tensor[nan_rand < 0.5] = float("nan")
-        return tensor
-    if min_val in (float("inf"), float("-inf")) or max_val in (float("inf"), float("-inf")):
-        rand_base = torch.rand(shape, dtype=torch.float32, generator=gen)
-        tensor = (rand_base * 2 - 1).to(dtype)
-        flat = tensor.flatten()
-        n = max(1, len(flat) // 20)
-        flat[:n] = float("-inf")
-        flat[-n:] = float("inf")
-        return tensor
-    if min_val == max_val:
-        return torch.full(shape, float(min_val), dtype=dtype)
-
-    finfo = torch.finfo(dtype)
-    lo = max(min_val, float(finfo.min))
-    hi = min(max_val, float(finfo.max))
-    rand_f64 = torch.rand(shape, dtype=torch.float64, generator=gen)
-    tensor_f64 = rand_f64 * (hi - lo) + lo
-    tensor_f64 = torch.clamp(tensor_f64, float(finfo.min), float(finfo.max))
-    return tensor_f64.to(dtype)
-
-
-def _run_case(name, N, thr, boxes_vr, scores_vr, seed, level="cann-bench"):
-    """Generate -> regularize -> golden vs candidate; exact index match.
-
-    Judgment = keep_indices exact list equality (length + order + values)
-    vs golden — NMS outputs indices, not values, so tolerance metrics do
-    not apply.
-    """
-    gc.collect()
-    torch.npu.empty_cache()
-
-    boxes = _gen_tensor([N, 4], boxes_vr, seed)
-    scores = _gen_tensor([N], scores_vr, seed + 1)
-    reg_boxes, reg_scores = get_input(boxes, scores, iou_threshold=thr)
-
-    ref = golden_nms(reg_boxes, reg_scores, thr)
-    out = nms(reg_boxes.npu(), reg_scores.npu(), thr).cpu().long()
-
-    match = out.numel() == ref.numel() and torch.equal(out, ref.cpu())
-    tag = "PRECISION_PASS" if match else "PRECISION_FAIL"
-    extra = ""
-    if not match:
-        extra = f" reason=length golden={ref.numel()} cand={out.numel()}" if out.numel() != ref.numel() else " reason=index mismatch"
-    print(f"[{tag}] {level} {name} N={N} thr={thr} M_golden={ref.numel()} M_candidate={out.numel()}{extra}")
-    return match
-
-
-def _run_boundary(level, name, fn):
-    try:
-        fn()
-        print(f"[BOUNDARY_PASS] {level} {name}")
-    except Exception as e:
-        print(f"[BOUNDARY_WARN] {level} {name}: {e}")
-
-
-# ========== L0 Tests ==========
-def test_nms_l0():
-    configs = [
-        ("l0-1", 1024, 0.5, (-1, 1)),
-        ("l0-2", 4096, 0.5, (float("nan"), float("nan"))),  # all-NaN: M=1
-        ("l0-3", 4096, 0.5, (0.0, 0.0)),  # all-zero: M=N
-    ]
-    ok = True
-    for i, (name, N, thr, vr) in enumerate(configs):
-        ok &= _run_case(name, N, thr, vr, (0.0, 1.0), SEED_BASE + 100 + i, level="l0")
-    return ok
-
-
-# ========== L1 Functional Tests ==========
-def test_nms_l1():
-    configs = [
-        ("l1-edge-n1", 1, 0.5, (-1, 1)),  # M=1 minimal input
-        ("l1-edge-n2", 2, 0.4, (-1, 1)),  # M in {1,2}
-        ("l1-tail-n513", 513, 0.3, (-2, 2)),  # tail block +1
-        ("l1-tail-mid-n1040", 1040, 0.5, (-1, 1)),
-        ("l1-prime-n1013", 1013, 0.6, (-3, 3)),  # prime, non-aligned
-        ("l1-thr-loose", 1024, 0.99, (-1, 1)),  # extreme high keep rate
-        ("l1-thr-strict", 1024, 0.01, (-1, 1)),  # extreme low keep rate
-    ]
-    ok = True
-    for i, (name, N, thr, vr) in enumerate(configs):
-        ok &= _run_case(name, N, thr, vr, (0.0, 1.0), SEED_BASE + 200 + i, level="l1")
-    return ok
-
-
-# ========== L2 Exception Tests ==========
-def test_nms_l2():
-
-    def test_fp16_boxes():
-        boxes = torch.rand(64, 4, dtype=torch.float16).npu()
-        scores = torch.rand(64, dtype=torch.float32).npu()
-        nms(boxes, scores, 0.5)
-
-    def test_fp64_scores():
-        boxes = torch.rand(64, 4, dtype=torch.float32).npu()
-        scores = torch.rand(64, dtype=torch.float64).npu()
-        nms(boxes, scores, 0.5)
-
-    def test_5col_boxes():
-        boxes = torch.rand(64, 5, dtype=torch.float32).npu()
-        scores = torch.rand(64, dtype=torch.float32).npu()
-        nms(boxes, scores, 0.5)
-
-    def test_scores_len_mismatch():
-        boxes = torch.rand(64, 4, dtype=torch.float32).npu()
-        scores = torch.rand(63, dtype=torch.float32).npu()
-        nms(boxes, scores, 0.5)
-
-    def test_n_over_max():
-        boxes = torch.rand(4097, 4, dtype=torch.float32).npu()
-        scores = torch.rand(4097, dtype=torch.float32).npu()
-        nms(boxes, scores, 0.5)
-
-    def test_thr_out_of_range():
-        boxes = torch.rand(64, 4, dtype=torch.float32).npu()
-        scores = torch.rand(64, dtype=torch.float32).npu()
-        nms(boxes, scores, 1.5)
-
-    _run_boundary("l2", "fp16_boxes_rejected", test_fp16_boxes)
-    _run_boundary("l2", "fp64_scores_rejected", test_fp64_scores)
-    _run_boundary("l2", "5col_boxes_rejected", test_5col_boxes)
-    _run_boundary("l2", "scores_len_mismatch_rejected", test_scores_len_mismatch)
-    _run_boundary("l2", "n_over_4096_rejected", test_n_over_max)
-    _run_boundary("l2", "thr_out_of_range_rejected", test_thr_out_of_range)
-
-
-# ========== Boundary Tests ==========
-def test_nms_boundary():
-
-    def test_inf_mix():
-        boxes = torch.empty(512, 4, dtype=torch.float32).uniform_(-5, 10)
-        boxes.view(-1)[0] = float("inf")
-        boxes.view(-1)[1] = float("-inf")
-        boxes, scores = get_input(boxes, torch.rand(512), 0.5)
-        ref = golden_nms(boxes, scores, 0.5)
-        out = nms(boxes.npu(), scores.npu(), 0.5).cpu().long()
-        assert torch.equal(out, ref.cpu())
-
-    def test_nan_boxes():
-        boxes = torch.full((512, 4), float("nan"))
-        scores = torch.rand(512)
-        boxes, scores = get_input(boxes, scores, 0.5)
-        ref = golden_nms(boxes, scores, 0.5)
-        out = nms(boxes.npu(), scores.npu(), 0.5).cpu().long()
-        assert torch.equal(out, ref.cpu())  # NaN suppresses all but box 0: M=1
-
-    def test_zero_boxes():
-        boxes = torch.zeros(1024, 4)
-        scores = torch.rand(1024)  # ties -> get_input de-duplicates
-        boxes, scores = get_input(boxes, scores, 0.5)
-        ref = golden_nms(boxes, scores, 0.5)
-        out = nms(boxes.npu(), scores.npu(), 0.5).cpu().long()
-        assert torch.equal(out, ref.cpu())  # IoU=0 -> all kept: M=N
-
-    def test_fp16_max_coords():
-        boxes = torch.empty(256, 4, dtype=torch.float32).uniform_(-65504, 65504)
-        boxes, scores = get_input(boxes, torch.rand(256), 0.5)
-        ref = golden_nms(boxes, scores, 0.5)
-        out = nms(boxes.npu(), scores.npu(), 0.5).cpu().long()
-        assert torch.equal(out, ref.cpu())
-
-    def test_empty_input():
-        boxes = torch.rand(0, 4, dtype=torch.float32).npu()
-        scores = torch.rand(0, dtype=torch.float32).npu()
-        out = nms(boxes, scores, 0.5)
-        assert out.numel() == 0
-
-    _run_boundary("boundary", "inf_mix_exact_match", test_inf_mix)
-    _run_boundary("boundary", "nan_boxes_all_suppressed", test_nan_boxes)
-    _run_boundary("boundary", "zero_boxes_all_kept", test_zero_boxes)
-    _run_boundary("boundary", "fp16_max_coords", test_fp16_max_coords)
-    _run_boundary("boundary", "empty_n0", test_empty_input)
-
-
-# ========== cann-bench 20 Cases ==========
-def test_nms_cann_bench():
-    configs = [
-        ("cann-bench-1", 1024, 0.5, (-1, 1)),
-        ("cann-bench-2", 4096, 0.3, (-2, 2)),
-        ("cann-bench-3", 4096, 0.7, (-3, 3)),
-        ("cann-bench-4", 4096, 0.1, (-10, 10)),
-        ("cann-bench-5", 4096, 0.9, (-100, 100)),
-        ("cann-bench-6", 4096, 0.05, (-1000, 1000)),
-        ("cann-bench-7", 1023, 0.5, (-0.1, 0.1)),
-        ("cann-bench-8", 1009, 0.3, (-1, 2)),
-        ("cann-bench-9", 1537, 0.7, (-5, 10)),
-        ("cann-bench-10", 3001, 0.4, (-50, 100)),
-        ("cann-bench-11", 2049, 0.5, (-65504, 65504)),
-        ("cann-bench-12", 4001, 0.6, (-88, 88)),
-        ("cann-bench-13", 3001, 0.5, (float("-inf"), float("inf"))),
-        ("cann-bench-14", 4096, 0.5, (float("nan"), float("nan"))),
-        ("cann-bench-15", 4096, 0.5, (0.0, 0.0)),
-        ("cann-bench-16", 511, 0.2, (-0.5, 0.5)),
-        ("cann-bench-17", 2047, 0.8, (-1, 3)),
-        ("cann-bench-18", 4095, 0.35, (-1000, 1000)),
-        ("cann-bench-19", 4096, 0.45, (-0.2, 0.2)),
-        ("cann-bench-20", 4096, 0.55, (-20, 40)),
-    ]
-    ok = True
-    for case_id, (name, N, thr, vr) in enumerate(configs, start=1):
-        ok &= _run_case(name, N, thr, vr, (0.0, 1.0), SEED_BASE + case_id, level="cann-bench")
-    return ok
-
-
-# ========== Main ==========
-def main():
-    parser = argparse.ArgumentParser(description="NMS example with cann-bench 20 cases")
-    parser.add_argument(
-        "--level",
-        default="l0",
-        choices=["l0", "l1", "l2", "boundary", "cann-bench", "all"],
-        help="Test level to run (default: l0)",
-    )
-    args = parser.parse_args()
-
-    tilelang.disable_cache()
-    torch.manual_seed(0)
-
-    blocking_ok = True
-    if args.level in ("l0", "all"):
-        blocking_ok &= test_nms_l0()
-    if args.level in ("l1", "all"):
-        blocking_ok &= test_nms_l1()
-    if args.level in ("l2", "all"):
-        test_nms_l2()
-    if args.level in ("boundary", "all"):
-        test_nms_boundary()
-    if args.level in ("cann-bench", "all"):
-        blocking_ok &= test_nms_cann_bench()
-
-    if blocking_ok:
-        print("Test Passed!")
-        sys.exit(0)
-    sys.exit(1)
-
-
-if __name__ == "__main__":
-    main()
