@@ -424,3 +424,45 @@ def nms(boxes: torch.Tensor, scores: torch.Tensor, iou_threshold: float):
     M = int(out[N].item())  # 4B scalar D2H (whitelisted)
     out.resize_(M)  # metadata shrink only
     return out
+
+
+# ----------------------------------------------------------------------------
+# CI smoke test (examples/bench_test.sh runs this file directly and requires
+# "Kernel Output Match!" or "TEST PASSED!" in the output, same as the
+# lstm/gru/depthwise_conv_2d smoke tests).  The full layered suite
+# (L0/L1/L2/Boundary over the 20 cann-bench cases) lives in test_nms.py.
+# ----------------------------------------------------------------------------
+if __name__ == "__main__":
+    torch.manual_seed(0)
+
+    def _smoke_golden(boxes, scores, thr):
+        """Pure-torch greedy NMS with the kernel's frozen IoU formula."""
+        areas = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+        x1 = torch.maximum(boxes[:, None, 0], boxes[None, :, 0])
+        y1 = torch.maximum(boxes[:, None, 1], boxes[None, :, 1])
+        x2 = torch.minimum(boxes[:, None, 2], boxes[None, :, 2])
+        y2 = torch.minimum(boxes[:, None, 3], boxes[None, :, 3])
+        inter = (x2 - x1).clamp(min=0) * (y2 - y1).clamp(min=0)
+        iou = inter / (areas[:, None] + areas[None, :] - inter + 1e-6)
+        _, order = scores.sort(descending=True)
+        suppressed = torch.zeros(scores.shape[0], dtype=torch.bool)
+        keep = []
+        for idx in order.tolist():
+            if suppressed[idx]:
+                continue
+            keep.append(idx)
+            suppressed |= ~(iou[idx] <= thr)
+        return keep
+
+    for n, thr in ((1024, 0.5), (4096, 0.3)):
+        boxes = torch.empty(n, 4)
+        boxes[:, :2].uniform_(-1.0, 1.0)
+        boxes[:, 2:] = boxes[:, :2] + torch.rand(n, 2)  # legal: x2 > x1, y2 > y1
+        # k/n scores are exactly distinct in fp32 (k * 2**-12), so the greedy
+        # order is deterministic without tied-score regularization.
+        scores = (torch.randperm(n).double() / n).float()
+        out = nms(boxes.npu(), scores.npu(), thr).cpu().long().tolist()
+        ref = _smoke_golden(boxes, scores, thr)
+        assert out == ref, f"smoke failed: N={n} kept {len(out)} vs golden {len(ref)}"
+        print(f"[SMOKE] N={n} thr={thr} kept={len(out)}/{n} exact match")
+    print("Kernel Output Match!")
