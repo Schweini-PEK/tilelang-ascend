@@ -1,23 +1,30 @@
-"""GroupNorm example — multi-case optimized version with cann-bench 20 cases.
+# ----------------------------------------------------------------------------
+# Copyright (c) 2026 Huawei Technologies Co., Ltd.
+# This program is free software, you can redistribute it and/or modify it under
+# the terms of the CANN Open Software License Agreement Version 2.0 (the
+# "License"). You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY
+# KIND, EITHER EXPRESS OR IMPLIED.
+# ----------------------------------------------------------------------------
 
-Expert mode GroupNorm with Pass 2 Double Buffer pipeline for arbitrary
-shape, dtype, num_groups, and epsilon. Targets cann-bench multi-case evaluation.
+"""GroupNorm TileLang kernel — Expert mode, double-buffer pipeline.
+
+Expert mode GroupNorm with a Pass 2 double buffer pipeline for arbitrary
+shape, dtype, num_groups, and epsilon.
 
 Algorithm:
     y = (x - mean) / sqrt(var + eps) * gamma + beta  (per-group)
 
-Reference: torch.nn.functional.group_norm
+Reference: torch.nn.functional.group_norm (golden_group_norm in test_group_norm.py)
 
 Key optimizations:
 - Expert mode (AUTO_SYNC=False) with Pass 2 double buffer pipeline
 - MTE2→V→MTE3 three-way flag pipeline for overlap
 - Adaptive spatial tiling via UB budget formula
-- 2D Developer mode for S=1 inputs
-"""
+- 2D Developer mode path for S=1 inputs
 
-import argparse
-import gc
-import sys
+Interface: group_norm(x, gamma, beta, num_groups, epsilon) -> y
+"""
 
 import torch
 
@@ -43,19 +50,6 @@ pass_configs_2d = {
     tilelang.PassConfigKey.TL_ASCEND_MEMORY_PLANNING: True,
     tilelang.PassConfigKey.TL_ASCEND_AUTO_CV_COMBINE: True,
 }
-
-_DTYPE_MAP = {
-    "float16": torch.float16,
-    "float32": torch.float32,
-    "bfloat16": torch.bfloat16,
-}
-
-_CANNBENCH_THRESHOLDS = {
-    "float16": 2**-10,
-    "bfloat16": 2**-7,
-    "float32": 2**-13,
-}
-
 
 _kernel_cache = {}
 _kernel_cache_2d = {}
@@ -379,14 +373,6 @@ def group_norm_kernel_2d(
     return main
 
 
-# ========== Golden Reference ==========
-def golden_group_norm(x, gamma, beta, num_groups, eps=1e-5):
-    """PyTorch reference: torch.nn.functional.group_norm."""
-    if x.ndim == 2:
-        return torch.nn.functional.group_norm(x.unsqueeze(-1), num_groups, gamma, beta, eps).squeeze(-1)
-    return torch.nn.functional.group_norm(x, num_groups, gamma, beta, eps)
-
-
 # ========== Tiling & Host Wrapper ==========
 def _find_block_S(S, cpg, dtype_str):
     UB_BUDGET = 192 * 1024
@@ -503,255 +489,39 @@ def group_norm(x, gamma, beta, num_groups, epsilon=1e-5):
     return y_4d.reshape(original_shape)
 
 
-# ========== Precision Standards ==========
-def get_precision(dtype):
-    precision_map = {
-        "float16": (1e-3, 1e-3),
-        "float32": (1e-4, 1e-4),
-        "bfloat16": (1e-2, 5e-3),
-    }
-    return precision_map[dtype]
+# ----------------------------------------------------------------------------
+# CI smoke test (examples/bench_test.sh runs this file directly and requires
+# "Kernel Output Match!" or "TEST PASSED!" in the output, same as the
+# lstm/gru/depthwise_conv_2d/nms smoke tests).  The full layered suite over
+# the 20 cann-bench cases lives in test_group_norm.py.
+# ----------------------------------------------------------------------------
+if __name__ == "__main__":
+    import torch.nn.functional as F
 
-
-# ========== cann-bench Precision Checker ==========
-def _mere_mare(actual, golden):
-    diff = (actual.float() - golden.float()).abs()
-    denom = golden.float().abs() + 1e-7
-    rel_err = diff / denom
-    both_nan = torch.isnan(actual.float()) & torch.isnan(golden.float())
-    both_inf = torch.isinf(actual.float()) & torch.isinf(golden.float())
-    rel_err = torch.where(both_nan | both_inf, torch.zeros_like(rel_err), rel_err)
-    mere = rel_err.mean().item()
-    mare = rel_err.max().item()
-    return mere, mare
-
-
-def check_precision(actual, golden, dtype_str, label=""):
-    mere, mare = _mere_mare(actual, golden)
-    threshold = _CANNBENCH_THRESHOLDS[dtype_str]
-    mare_threshold = 10 * threshold
-    passed = mere < threshold and mare < mare_threshold
-    status = "PASS" if passed else "FAIL"
-    tag = f"[{'PRECISION_PASS' if passed else 'PRECISION_FAIL'}]"
-    print(f"{tag} {label} dtype={dtype_str} MERE={mere:.6e} MARE={mare:.6e} threshold={threshold:.6e} -> {status}")
-    return passed
-
-
-# ========== Input Generation ==========
-def _gen_input(shape, dtype, value_range, seed_offset=0):
-    torch.manual_seed(42 + seed_offset)
-    torch_dtype = _DTYPE_MAP[dtype] if isinstance(dtype, str) else dtype
-    dtype_str = dtype if isinstance(dtype, str) else str(dtype).replace("torch.", "")
-
-    if value_range == "inf":
-        x = torch.randn(shape, dtype=torch.float32).uniform_(-1, 1)
-        x.view(-1)[0] = float("inf")
-        if x.numel() > 1:
-            x.view(-1)[1] = float("-inf")
-    elif value_range == "nan":
-        x = torch.randn(shape, dtype=torch.float32).uniform_(-1, 1)
-        x.view(-1)[0] = float("nan")
-    elif value_range == "zero":
-        x = torch.zeros(shape, dtype=torch.float32)
-    else:
-        lo, hi = value_range
-        x = torch.empty(shape, dtype=torch.float32).uniform_(lo, hi)
-
-    return x.to(torch_dtype).npu(), dtype_str
-
-
-def _cleanup_npu():
-    gc.collect()
-    torch.npu.empty_cache()
-
-
-# ========== Test Runner ==========
-def _run_case(name, shape, dtype, num_groups, eps, value_range, level="cann-bench"):
-    _cleanup_npu()
-    dtype_str = dtype if isinstance(dtype, str) else str(dtype).replace("torch.", "")
-    C = shape[1]
-
-    x, dtype_str = _gen_input(shape, dtype_str, value_range, seed_offset=hash(name) % 1000)
-    gamma = torch.randn(C, dtype=_DTYPE_MAP[dtype_str]).npu()
-    beta = torch.randn(C, dtype=_DTYPE_MAP[dtype_str]).npu()
-
-    y = group_norm(x, gamma, beta, num_groups, eps)
-    ref = golden_group_norm(x.cpu().float(), gamma.cpu().float(), beta.cpu().float(), num_groups, eps).to(_DTYPE_MAP[dtype_str])
-
-    if level in ("l0", "l1"):
-        atol, rtol = get_precision(dtype_str)
-        max_diff = (y.cpu().float() - ref.float()).abs().max().item()
-        try:
-            torch.testing.assert_close(y.cpu(), ref, atol=atol, rtol=rtol)
-            print(f"[PRECISION_PASS] {level} {name} shape={shape} dtype={dtype_str} max_diff={max_diff:.6e}")
-            return True
-        except Exception as e:
-            print(f"[PRECISION_FAIL] {level} {name} shape={shape} dtype={dtype_str} max_diff={max_diff:.6e}: {e}")
-            return False
-    else:
-        return check_precision(y.cpu(), ref, dtype_str, label=f"{level} {name} shape={shape}")
-
-
-def _run_boundary(level, name, fn):
-    try:
-        fn()
-        print(f"[BOUNDARY_PASS] {level} {name}")
-    except Exception as e:
-        print(f"[BOUNDARY_WARN] {level} {name}: {e}")
-
-
-# ========== L0 Tests ==========
-def test_group_norm_l0():
-    configs = [
-        ("l0-1", [8, 32, 64, 64], "float16", 8, 1e-5, (-1, 1)),
-        ("l0-2", [4, 64, 128, 128], "float32", 16, 1e-5, (-2, 2)),
-        ("l0-3", [2, 128, 256, 256], "bfloat16", 32, 1e-5, (-3, 3)),
-    ]
-    ok = True
-    for name, shape, dtype, num_groups, eps, vrange in configs:
-        ok &= _run_case(name, shape, dtype, num_groups, eps, vrange, level="l0")
-    return ok
-
-
-# ========== L1 Functional Tests ==========
-def test_group_norm_l1():
-    configs = [
-        ("l1-1", [16, 257, 32, 31], "float16", 1, 1e-5, (-10, 10)),
-        ("l1-2", [8, 512, 17, 15], "float32", 2, 1e-5, (-100, 100)),
-        ("l1-3", [64, 64, 128], "bfloat16", 4, 1e-5, (-5, 5)),
-        ("l1-4", [5, 48, 33, 65], "bfloat16", 6, 1e-4, (-3, 6)),
-        ("l1-5", [1023, 257], "float16", 1, 1e-6, (-1, 1)),
-        ("l1-6", [2, 60, 5, 7, 480], "float32", 4, 1e-5, (-10, 10)),
-    ]
-    ok = True
-    for name, shape, dtype, num_groups, eps, vrange in configs:
-        ok &= _run_case(name, shape, dtype, num_groups, eps, vrange, level="l1")
-    return ok
-
-
-# ========== L2 Exception Tests ==========
-def test_group_norm_l2():
-    def test_unsupported_dtype():
-        x = torch.ones(2, 8, 4, 4, dtype=torch.int32).npu()
-        gamma = torch.ones(8, dtype=torch.int32).npu()
-        beta = torch.ones(8, dtype=torch.int32).npu()
-        group_norm(x, gamma, beta, 2, 1e-5)
-
-    def test_c_not_divisible():
-        x = torch.randn(2, 7, 4, 4, dtype=torch.float16).npu()
-        gamma = torch.randn(7, dtype=torch.float16).npu()
-        beta = torch.randn(7, dtype=torch.float16).npu()
-        group_norm(x, gamma, beta, 3, 1e-5)
-
-    def test_none_input():
-        group_norm(None, None, None, 1, 1e-5)
-
-    _run_boundary("l2", "unsupported_dtype_int32", test_unsupported_dtype)
-    _run_boundary("l2", "c_not_divisible_by_num_groups", test_c_not_divisible)
-    _run_boundary("l2", "none_input", test_none_input)
-
-
-# ========== Boundary Tests ==========
-def test_group_norm_boundary():
-    def test_inf_input():
-        x = torch.randn(2, 8, 4, 4, dtype=torch.float16).npu()
-        x.view(-1)[0] = float("inf")
-        gamma = torch.randn(8, dtype=torch.float16).npu()
-        beta = torch.randn(8, dtype=torch.float16).npu()
-        y = group_norm(x, gamma, beta, 2, 1e-5)
-        assert torch.isinf(y.cpu()).any() or torch.isnan(y.cpu()).any()
-
-    def test_nan_input():
-        x = torch.randn(2, 8, 4, 4, dtype=torch.float16).npu()
-        x.view(-1)[0] = float("nan")
-        gamma = torch.randn(8, dtype=torch.float16).npu()
-        beta = torch.randn(8, dtype=torch.float16).npu()
-        y = group_norm(x, gamma, beta, 2, 1e-5)
-        assert torch.isnan(y.cpu()).any()
-
-    def test_all_zeros():
-        x = torch.zeros(2, 8, 4, 4, dtype=torch.float16).npu()
-        gamma = torch.randn(8, dtype=torch.float16).npu()
-        beta = torch.randn(8, dtype=torch.float16).npu()
-        y = group_norm(x, gamma, beta, 2, 1e-5)
-        ref = golden_group_norm(x.cpu().float(), gamma.cpu().float(), beta.cpu().float(), 2, 1e-5).to(torch.float16)
-        torch.testing.assert_close(y.cpu(), ref, atol=1e-3, rtol=1e-3)
-
-    def test_extreme_values():
-        x = torch.empty(2, 8, 4, 4, dtype=torch.float32).uniform_(-65504, 65504).to(torch.float16).npu()
-        gamma = torch.randn(8, dtype=torch.float16).npu()
-        beta = torch.randn(8, dtype=torch.float16).npu()
-        y = group_norm(x, gamma, beta, 2, 1e-5)
-        ref = golden_group_norm(x.cpu().float(), gamma.cpu().float(), beta.cpu().float(), 2, 1e-5).to(torch.float16)
-        torch.testing.assert_close(y.cpu(), ref, atol=1e-2, rtol=1e-2)
-
-    _run_boundary("boundary", "inf_input", test_inf_input)
-    _run_boundary("boundary", "nan_input", test_nan_input)
-    _run_boundary("boundary", "all_zeros", test_all_zeros)
-    _run_boundary("boundary", "extreme_values_fp16max", test_extreme_values)
-
-
-# ========== cann-bench 20 Cases ==========
-def test_group_norm_cann_bench():
-    configs = [
-        ("cann-bench-1", [8, 32, 64, 64], "float16", 8, 1e-5, (-1, 1)),
-        ("cann-bench-2", [4, 64, 128, 128], "float32", 16, 1e-5, (-2, 2)),
-        ("cann-bench-3", [2, 128, 256, 256], "bfloat16", 32, 1e-5, (-3, 3)),
-        ("cann-bench-4", [16, 257, 32, 31], "float16", 1, 1e-5, (-10, 10)),
-        ("cann-bench-5", [8, 512, 17, 15], "float32", 2, 1e-5, (-100, 100)),
-        ("cann-bench-6", [64, 64, 128], "bfloat16", 4, 1e-5, (-5, 5)),
-        ("cann-bench-7", [2, 256, 128, 128], "float16", 16, 1e-5, (-0.1, 0.1)),
-        ("cann-bench-8", [16, 127, 31, 33], "float32", 1, 1e-6, (-1, 1)),
-        ("cann-bench-9", [3, 64, 64, 64], "bfloat16", 8, 1e-3, (-0.5, 0.5)),
-        ("cann-bench-10", [7, 32, 63, 65], "float16", 4, 1e-4, (-1, 2)),
-        ("cann-bench-11", [3, 64, 127, 129], "float32", 8, 1e-4, (-50, 100)),
-        ("cann-bench-12", [5, 48, 33, 65], "bfloat16", 6, 1e-4, (-3, 6)),
-        ("cann-bench-13", [1023, 257], "float16", 1, 1e-6, (-1, 1)),
-        ("cann-bench-14", [2, 60, 5, 7, 480], "float32", 4, 1e-5, (-10, 10)),
-        ("cann-bench-15", [4, 31, 251, 251], "bfloat16", 1, 1e-8, "inf"),
-        ("cann-bench-16", [2, 64, 67, 71], "float16", 8, 1e-7, "nan"),
-        ("cann-bench-17", [8, 127, 33, 31], "float32", 1, 1e-4, "zero"),
-        ("cann-bench-18", [2, 256, 127, 129], "bfloat16", 16, 1e-5, (-0.2, 0.2)),
-        ("cann-bench-19", [4, 128, 255, 257], "float16", 32, 1e-3, (-65504, 65504)),
-        ("cann-bench-20", [1, 513, 63, 63], "float32", 3, 1e-6, (-20, 40)),
-    ]
-    ok = True
-    for name, shape, dtype, num_groups, eps, vrange in configs:
-        ok &= _run_case(name, shape, dtype, num_groups, eps, vrange, level="cann-bench")
-    return ok
-
-
-# ========== Main ==========
-def main():
-    parser = argparse.ArgumentParser(description="GroupNorm example with cann-bench 20 cases")
-    parser.add_argument(
-        "--level",
-        default="l0",
-        choices=["l0", "l1", "l2", "boundary", "cann-bench", "all"],
-        help="Test level to run (default: l0)",
-    )
-    args = parser.parse_args()
-
-    tilelang.disable_cache()
     torch.manual_seed(0)
 
-    blocking_ok = True
-    if args.level in ("l0", "all"):
-        blocking_ok &= test_group_norm_l0()
-    if args.level in ("l1", "all"):
-        blocking_ok &= test_group_norm_l1()
-    if args.level in ("l2", "all"):
-        test_group_norm_l2()
-    if args.level in ("boundary", "all"):
-        test_group_norm_boundary()
-    if args.level in ("cann-bench", "all"):
-        blocking_ok &= test_group_norm_cann_bench()
+    def _ref(x, gamma, beta, g, eps):
+        if x.ndim == 2:
+            return F.group_norm(x.unsqueeze(-1), g, gamma, beta, eps).squeeze(-1)
+        return F.group_norm(x, g, gamma, beta, eps)
 
-    if blocking_ok:
-        print("Test Passed!")
-        sys.exit(0)
-    sys.exit(1)
-
-
-if __name__ == "__main__":
-    main()
+    # one case per kernel path and dtype: 4D expert / 4D expert / 2D developer
+    for shape, dtype, g, eps in (
+        ((8, 32, 64, 64), torch.float16, 8, 1e-5),
+        ((4, 64, 128, 128), torch.float32, 16, 1e-5),
+        ((1023, 257), torch.bfloat16, 1, 1e-6),
+    ):
+        x = (torch.rand(*shape) * 2 - 1).to(dtype)
+        gamma = (torch.rand(shape[1]) * 2 - 1).to(dtype)
+        beta = (torch.rand(shape[1]) * 2 - 1).to(dtype)
+        y = group_norm(x.npu(), gamma.npu(), beta.npu(), g, eps).cpu()
+        ref = _ref(x.float(), gamma.float(), beta.float(), g, eps).to(dtype)
+        atol, rtol = {
+            torch.float16: (1e-3, 1e-3),
+            torch.float32: (1e-4, 1e-4),
+            torch.bfloat16: (1e-2, 5e-3),
+        }[dtype]
+        torch.testing.assert_close(y, ref, atol=atol, rtol=rtol)
+        diff = (y.float() - ref.float()).abs().max().item()
+        print(f"[SMOKE] {tuple(shape)} {str(dtype).split('.')[-1]} G={g} max_abs={diff:.3e}")
+    print("Kernel Output Match!")
