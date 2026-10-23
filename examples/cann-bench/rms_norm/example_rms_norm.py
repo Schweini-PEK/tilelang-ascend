@@ -361,6 +361,15 @@ def _select_tiling(S, D, dtype_str):
 # ========== Host Wrapper ==========
 def rms_norm_host(x, gamma, eps=1e-6):
     """Host-side wrapper: flatten (..., D) -> (S, D), call kernel, reshape back."""
+    if not isinstance(x, torch.Tensor) or not isinstance(gamma, torch.Tensor):
+        raise TypeError(f"rms_norm_host: x/gamma must be torch tensors, got {type(x).__name__}/{type(gamma).__name__}")
+    if x.dtype not in (torch.float16, torch.float32, torch.bfloat16) or gamma.dtype != x.dtype:
+        raise TypeError(f"rms_norm_host: x/gamma must be float16/float32/bfloat16 of the same dtype, got x={x.dtype}, gamma={gamma.dtype}")
+    if gamma.dim() != 1 or gamma.shape[0] != x.shape[-1]:
+        raise ValueError(f"rms_norm_host: gamma must be [D] with D=x.shape[-1]={x.shape[-1]}, got shape {tuple(gamma.shape)}")
+    if not x.is_contiguous() or not gamma.is_contiguous():
+        raise ValueError("rms_norm_host: x/gamma must be contiguous tensors")
+
     original_shape = x.shape
     D = original_shape[-1]
     S = 1
