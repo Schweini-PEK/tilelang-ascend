@@ -2,7 +2,7 @@
 
 本文档介绍 Vector 型两遍扫描归一化算子的完整优化模式。此类算子的核心结构为"Pass 1 归约求统计量（mean/rms 等）+ Pass 2 逐元素应用统计量并写回"，属于纯 Vector 型（无 Cube 操作）。
 
-参考实现：`examples/cann-bench/rms_norm/example_rms_norm.py`
+参考实现：`examples/cann-bench/rms_norm/rms_norm.py`
 
 ---
 
