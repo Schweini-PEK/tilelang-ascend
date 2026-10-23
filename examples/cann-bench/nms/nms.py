@@ -326,18 +326,18 @@ def _greedy_kernel(N, N_pad_rows, B, NB, NW16, dtype="float"):
     def main(
         bitmap: T.Tensor((N_pad_rows, NW16), "uint16"),
         idx: T.Tensor((N,), dtype),
-        out: T.Tensor((N + 1,), dtype),
+        out: T.Tensor((N + 1,), "int64"),
     ):
         with T.Kernel(1, is_npu=True) as (cid, vid):
             keepmask = T.alloc_ub((NW16,), "uint16")
             chunk = T.alloc_ub((B, NW16), "uint16")
-            kept = T.alloc_ub((N,), dtype)
-            cnt = T.alloc_ub((1,), dtype)
+            kept = T.alloc_ub((N,), "int64")
+            cnt = T.alloc_ub((1,), "int64")
             idx_ub = T.alloc_ub((N,), dtype)
 
             T.copy(idx[0:N], idx_ub[0:N])
             T.tile.fill(keepmask, -1)  # all keepable (uint16 Duplicate)
-            T.tile.fill(cnt, 0.0)
+            cnt[0] = 0
             T.barrier_all()  # MTE2/V -> S (decisions read keepmask bits)
             for c in T.serial(NB):
                 T.copy(bitmap[c * B : (c + 1) * B, 0:NW16], chunk)
@@ -364,8 +364,8 @@ def _greedy_kernel(N, N_pad_rows, B, NB, NW16, dtype="float"):
                                     T.tile.bitwise_and(keepmask, keepmask, chunk[k, :NW16])
                                     T.barrier_all()  # V -> S (next decision)
                                     kc = T.cast(cnt[0], "int32")
-                                    kept[kc] = idx_ub[kk]
-                                    cnt[0] = cnt[0] + 1.0
+                                    kept[kc] = T.cast(idx_ub[kk], "int64")
+                                    cnt[0] = cnt[0] + 1
                 T.barrier_all()  # V -> MTE2 (next batch chunk DMA)
             T.barrier_all()  # S -> MTE3
             T.copy(kept[0:N], out[0:N])
@@ -378,7 +378,7 @@ def _greedy_kernel(N, N_pad_rows, B, NB, NW16, dtype="float"):
 def nms(boxes: torch.Tensor, scores: torch.Tensor, iou_threshold: float):
     """Non-Maximum Suppression — 4 TileLang kernels, all-NPU, no aclnn ops.
 
-    keep_indices (fp32 carrier, exact integer values) ordered by descending
+    keep_indices (int64, matching the cann-bench operator spec) ordered by descending
     score. Input contract: boxes [N, 4] fp32 contiguous, scores [N] fp32
     contiguous, iou_threshold in (0, 1), N <= 4096 (greedy chunk UB budget).
     """
@@ -397,7 +397,7 @@ def nms(boxes: torch.Tensor, scores: torch.Tensor, iou_threshold: float):
 
     N = boxes.shape[0]
     if N == 0:
-        return boxes[0:0, 0]
+        return torch.empty(0, dtype=torch.int64, device=boxes.device)
     if N > _MAX_N:
         raise ValueError(f"nms: N={N} exceeds supported maximum {_MAX_N} (greedy bitmap chunk would exceed the 192KB UB budget)")
 
@@ -421,7 +421,7 @@ def nms(boxes: torch.Tensor, scores: torch.Tensor, iou_threshold: float):
         _greedy_cache[key] = _greedy_kernel(N, tp["N_pad_rows"], tp["B"], tp["NB"], tp["NW16"])
     out = _greedy_cache[key](bitmap, sort_idx)
 
-    M = int(out[N].item())  # 4B scalar D2H (whitelisted)
+    M = int(out[N].item())  # 8B scalar D2H (whitelisted)
     out.resize_(M)  # metadata shrink only
     return out
 
