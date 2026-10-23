@@ -292,9 +292,33 @@ TVM_DLL const Op &ascend_tail_scalar();
 
 TVM_DLL const Op &ascend_tail_reduce();
 
+TVM_DLL const Op &ascend_tail_compare();
+
+TVM_DLL const Op &ascend_tail_compare_scalar();
+
+TVM_DLL const Op &ascend_tail_select();
+
+TVM_DLL const Op &ascend_tail_broadcast();
+
 TVM_DLL const Op &ascend_copy_cv_experiment();
 
 TVM_DLL const Op &ascend_copy_vc_experiment();
+
+// Internal operations inserted by the compiler-managed Vector-mask passes.
+#define TL_ASCEND_SEMANTIC_OP(...)
+#define TL_ASCEND_PHYSICAL(selected, selector, dtype_domain, operands,         \
+                           payload, emitter, intrinsic)                        \
+  TVM_DLL const Op &selected();
+#define TL_ASCEND_HELPER(selected, selector, contract)                         \
+  TVM_DLL const Op &selected();
+#include "ascend_vector_mask_ops.inc"
+#undef TL_ASCEND_HELPER
+#undef TL_ASCEND_PHYSICAL
+#undef TL_ASCEND_SEMANTIC_OP
+
+TVM_DLL const Op &ascend_set_mask_mode();
+
+TVM_DLL const Op &ascend_set_mask_payload();
 } // namespace tl
 } // namespace tvm
 

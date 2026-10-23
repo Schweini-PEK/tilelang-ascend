@@ -15,6 +15,7 @@
 #endif
 
 #include "shmem.h"
+#include "tl_templates/ascend/reduce_2d_v2.h"
 
 #define CUDART_INF_F 1.0f / 0.0f
 
@@ -65,10 +66,29 @@ copy_gm_to_l1(LocalTensor<T> dstTensor, GlobalTensor<T> srcTensor,
   // otherwise they clobber data already written into the same NZ tile. The
   // full-tile clear is only correct when it targets the tile base, which the
   // codegen guarantees by passing need_clear = (dst_offset == 0).
-  if (need_clear && (tailM != dstM || tailN != dstN)) {
-    AscendC::InitConstValue(
-        dstTensor,
-        {1, static_cast<uint16_t>(dstM * dstN * sizeof(T) / 32), 0, 0});
+  //
+  // The clear must cover the zN FRACTAL extent, not just dstM*dstN elements:
+  // the zN layout pads rows up to 16 and interleaves the padding holes inside
+  // the tile (e.g. zN(K=200, N=128) stores each 16-column N band at a
+  // roundUp16(K)*16 = 3328-element stride, leaving 8 unwritten K rows per
+  // band). The GM copy only writes valid elements, and Mmad rounds its k
+  // argument up to whole C0 fractals, so a gemm_v0 K-tail tile
+  // (kSize % 16 != 0) multiplies whatever sits in those holes (issue #1341).
+  // Zero-init them whenever the tile has fractal padding
+  // (extent != dstM*dstN) or a partial tail copy.
+  constexpr uint32_t ELE_PER_C0 = Catlass::BYTE_PER_C0 / sizeof(T);
+  constexpr uint32_t C0_PER_FRACTAL = Catlass::C0_NUM_PER_FRCATLASSAL;
+  const uint32_t paddedRows =
+      (dstM + C0_PER_FRACTAL - 1) / C0_PER_FRACTAL * C0_PER_FRACTAL;
+  const uint32_t fractalExtent =
+      ((dstN + ELE_PER_C0 - 1) / ELE_PER_C0) * paddedRows * ELE_PER_C0;
+  if (need_clear &&
+      (tailM != dstM || tailN != dstN || fractalExtent != dstM * dstN)) {
+    AscendC::InitConstValue(dstTensor,
+                            {1,
+                             static_cast<uint16_t>(fractalExtent * sizeof(T) /
+                                                   Catlass::BYTE_PER_C0),
+                             0, 0});
     AscendC::PipeBarrier<PIPE_MTE2>();
   }
   auto layout = MakeLayoutFromTag(LayoutGM{tailM, realSrcN});
@@ -471,33 +491,33 @@ reduce_sum_half(LocalTensor<T> const &dstTensor,
 // stride, so one repeat per row with srcRepStride set to the PHYSICAL row width
 // reduces the intended region. One repeat covers at most 256 bytes, which is
 // what bounds the usable width.
-template <typename T>
+template <typename T, bool isSetMask = true>
 CATLASS_DEVICE void
 reduce_max_narrow(LocalTensor<T> const &dstTensor,
                   LocalTensor<T> const &srcTensor, const int32_t mask,
                   const int32_t repeatTime, const int32_t srcRepStride) {
-  AscendC::WholeReduceMax<T>(dstTensor, srcTensor, mask, repeatTime, 1, 1,
-                             srcRepStride,
-                             AscendC::ReduceOrder::ORDER_ONLY_VALUE);
+  AscendC::WholeReduceMax<T, isSetMask>(dstTensor, srcTensor, mask, repeatTime,
+                                        1, 1, srcRepStride,
+                                        AscendC::ReduceOrder::ORDER_ONLY_VALUE);
 }
 
-template <typename T>
+template <typename T, bool isSetMask = true>
 CATLASS_DEVICE void
 reduce_min_narrow(LocalTensor<T> const &dstTensor,
                   LocalTensor<T> const &srcTensor, const int32_t mask,
                   const int32_t repeatTime, const int32_t srcRepStride) {
-  AscendC::WholeReduceMin<T>(dstTensor, srcTensor, mask, repeatTime, 1, 1,
-                             srcRepStride,
-                             AscendC::ReduceOrder::ORDER_ONLY_VALUE);
+  AscendC::WholeReduceMin<T, isSetMask>(dstTensor, srcTensor, mask, repeatTime,
+                                        1, 1, srcRepStride,
+                                        AscendC::ReduceOrder::ORDER_ONLY_VALUE);
 }
 
-template <typename T>
+template <typename T, bool isSetMask = true>
 CATLASS_DEVICE void
 reduce_sum_narrow(LocalTensor<T> const &dstTensor,
                   LocalTensor<T> const &srcTensor, const int32_t mask,
                   const int32_t repeatTime, const int32_t srcRepStride) {
-  AscendC::WholeReduceSum<T>(dstTensor, srcTensor, mask, repeatTime, 1, 1,
-                             srcRepStride);
+  AscendC::WholeReduceSum<T, isSetMask>(dstTensor, srcTensor, mask, repeatTime,
+                                        1, 1, srcRepStride);
 }
 
 template <typename T, uint32_t M, uint32_t N, int32_t dim>
@@ -648,6 +668,20 @@ reduce_min(LocalTensor<T> const &dstTensor, LocalTensor<T> const &srcTensor,
     dstTensor.SetValue(i, reduce_scalar_min_safe(reducedValue, backupValue));
   }
 }
+
+// Expose the helper's Vector pipe to BiSheng automatic synchronization.
+#pragma begin_pipe(V)
+template <typename T, reduce2d_v2::Reduce2DKind Kind, bool Clear, uint32_t M,
+          uint32_t N, int32_t Dim, uint32_t PhysicalRow, bool AllowRepeatZero>
+CATLASS_DEVICE void reduce_2d(LocalTensor<T> const &dstTensor,
+                              LocalTensor<T> const &srcTensor,
+                              LocalTensor<T> const &sharedTmpBuffer) {
+  static_assert(std::is_same_v<T, float> && Dim == -1,
+                "Reduce2D v2 only supports fp32 row reduction");
+  reduce2d_v2::Reduce2D<T, Kind, Clear, M, N, PhysicalRow, AllowRepeatZero>(
+      dstTensor, srcTensor, sharedTmpBuffer);
+}
+#pragma end_pipe
 
 // ===================== Tail-aware vector helpers =========================
 // AscendTailMaskPropagation rewrites vector ops on tail UB tiles to these
@@ -941,6 +975,175 @@ CATLASS_DEVICE void tail_scalar(TailVecScalarOp op, LocalTensor<T> dst,
   }
 }
 
+// ---- compare / select ----------------------------------------------------
+// Compare and Select use a packed uint8 predicate.  Although the logical row
+// contains only ceil(physCol / 8) bytes, AscendC vector/MTE instructions start
+// every UB row on a 32-byte data-block boundary.  Memory planning widens
+// the predicate's backing allocation accordingly; the public Buffer shape and
+// GM representation remain densely packed.
+template <typename T>
+CATLASS_DEVICE bool tail_compare_value(T lhs, T rhs, AscendC::CMPMODE mode) {
+  // Bisheng rejects scalar half/bfloat16 comparison instructions in AICore
+  // functions.  Promote only the scalar control path; values written by
+  // select remain in their original dtype.
+  if constexpr (std::is_same_v<T, half> || std::is_same_v<T, bfloat16_t>) {
+    return tail_compare_value(static_cast<float>(lhs), static_cast<float>(rhs),
+                              mode);
+  } else {
+    switch (mode) {
+    case AscendC::CMPMODE::EQ:
+      return lhs == rhs;
+    case AscendC::CMPMODE::NE:
+      return lhs != rhs;
+    case AscendC::CMPMODE::GT:
+      return lhs > rhs;
+    case AscendC::CMPMODE::GE:
+      return lhs >= rhs;
+    case AscendC::CMPMODE::LT:
+      return lhs < rhs;
+    case AscendC::CMPMODE::LE:
+      return lhs <= rhs;
+    default:
+      return false;
+    }
+  }
+}
+
+template <typename T>
+CATLASS_DEVICE void
+tail_compare(LocalTensor<uint8_t> dst, LocalTensor<T> src0, LocalTensor<T> src1,
+             AscendC::CMPMODE mode, uint32_t validRow, uint32_t validCol,
+             uint32_t physRow, uint32_t physCol, uint32_t storageCol) {
+  (void)storageCol;
+  if (validRow == 0 || validCol == 0)
+    return;
+  constexpr uint32_t maskRowStride = 32;
+  dst.SetSize(physRow * maskRowStride);
+  AscendC::PipeBarrier<PIPE_ALL>();
+  for (uint32_t r = 0; r < validRow; ++r) {
+    for (uint32_t byte = 0; byte < (validCol + 7U) / 8U; ++byte) {
+      uint8_t packed = 0;
+      for (uint32_t bit = 0; bit < 8U; ++bit) {
+        uint32_t c = byte * 8U + bit;
+        if (c < validCol &&
+            tail_compare_value(src0.GetValue(r * physCol + c),
+                               src1.GetValue(r * physCol + c), mode)) {
+          packed |= static_cast<uint8_t>(1U << bit);
+        }
+      }
+      dst.SetValue(r * maskRowStride + byte, packed);
+    }
+  }
+  AscendC::PipeBarrier<PIPE_ALL>();
+}
+
+template <typename T>
+CATLASS_DEVICE void
+tail_compare_scalar(LocalTensor<uint8_t> dst, LocalTensor<T> src, T scalar,
+                    AscendC::CMPMODE mode, uint32_t validRow, uint32_t validCol,
+                    uint32_t physRow, uint32_t physCol, uint32_t storageCol) {
+  (void)storageCol;
+  if (validRow == 0 || validCol == 0)
+    return;
+  constexpr uint32_t maskRowStride = 32;
+  dst.SetSize(physRow * maskRowStride);
+  AscendC::PipeBarrier<PIPE_ALL>();
+  for (uint32_t r = 0; r < validRow; ++r) {
+    for (uint32_t byte = 0; byte < (validCol + 7U) / 8U; ++byte) {
+      uint8_t packed = 0;
+      for (uint32_t bit = 0; bit < 8U; ++bit) {
+        uint32_t c = byte * 8U + bit;
+        if (c < validCol &&
+            tail_compare_value(src.GetValue(r * physCol + c), scalar, mode)) {
+          packed |= static_cast<uint8_t>(1U << bit);
+        }
+      }
+      dst.SetValue(r * maskRowStride + byte, packed);
+    }
+  }
+  AscendC::PipeBarrier<PIPE_ALL>();
+}
+
+template <typename T>
+CATLASS_DEVICE void
+tail_select(LocalTensor<T> dst, LocalTensor<uint8_t> selMask,
+            LocalTensor<T> src0, LocalTensor<T> src1, AscendC::SELMODE mode,
+            uint32_t validRow, uint32_t validCol, uint32_t physRow,
+            uint32_t physCol, uint32_t storageCol) {
+  (void)storageCol;
+  if (validRow == 0 || validCol == 0)
+    return;
+  constexpr uint32_t maskRowStride = 32;
+  selMask.SetSize(physRow * maskRowStride);
+  AscendC::PipeBarrier<PIPE_ALL>();
+  for (uint32_t r = 0; r < validRow; ++r) {
+    for (uint32_t c = 0; c < validCol; ++c) {
+      uint8_t packed = selMask.GetValue(r * maskRowStride + c / 8U);
+      bool take_src0 = (packed & static_cast<uint8_t>(1U << (c & 7U))) != 0;
+      uint32_t index = r * physCol + c;
+      dst.SetValue(index,
+                   take_src0 ? src0.GetValue(index) : src1.GetValue(index));
+    }
+  }
+  AscendC::PipeBarrier<PIPE_ALL>();
+}
+
+template <typename T>
+CATLASS_DEVICE void
+tail_select_scalar(LocalTensor<T> dst, LocalTensor<uint8_t> selMask,
+                   LocalTensor<T> src, T scalar, AscendC::SELMODE mode,
+                   uint32_t validRow, uint32_t validCol, uint32_t physRow,
+                   uint32_t physCol, uint32_t storageCol) {
+  (void)storageCol;
+  if (validRow == 0 || validCol == 0)
+    return;
+  constexpr uint32_t maskRowStride = 32;
+  selMask.SetSize(physRow * maskRowStride);
+  AscendC::PipeBarrier<PIPE_ALL>();
+  for (uint32_t r = 0; r < validRow; ++r) {
+    for (uint32_t c = 0; c < validCol; ++c) {
+      uint8_t packed = selMask.GetValue(r * maskRowStride + c / 8U);
+      bool take_src = (packed & static_cast<uint8_t>(1U << (c & 7U))) != 0;
+      uint32_t index = r * physCol + c;
+      dst.SetValue(index, take_src ? src.GetValue(index) : scalar);
+    }
+  }
+  AscendC::PipeBarrier<PIPE_ALL>();
+}
+
+// ---- broadcast -----------------------------------------------------------
+template <typename T>
+CATLASS_DEVICE void
+tail_broadcast(LocalTensor<T> dst, LocalTensor<T> src, int axis,
+               uint32_t validRow, uint32_t validCol, uint32_t srcValidRow,
+               uint32_t srcValidCol, uint32_t dstPhysCol, uint32_t srcPhysCol) {
+  if (validRow == 0 || validCol == 0)
+    return;
+  if (axis == 1) {
+    uint32_t rows = validRow < srcValidRow ? validRow : srcValidRow;
+    constexpr uint32_t elemsPerBlock = 32 / sizeof(T);
+    uint32_t srcRowStride =
+        ((srcPhysCol + elemsPerBlock - 1) / elemsPerBlock) * elemsPerBlock;
+    AscendC::PipeBarrier<PIPE_ALL>();
+    for (uint32_t r = 0; r < rows; ++r) {
+      T scalar = src.GetValue(r * srcRowStride);
+      // Keep both full and tail rows on the vector path.  SetValue is a
+      // scalar-pipeline store and is not a sound producer for the following
+      // MTE3 copy on device; Duplicate supports an arbitrary element count and
+      // therefore writes exactly the valid prefix of every physical row.
+      AscendC::Duplicate(dst[r * dstPhysCol], scalar,
+                         static_cast<int32_t>(validCol));
+    }
+    AscendC::PipeBarrier<PIPE_ALL>();
+    return;
+  }
+  uint32_t cols = validCol < srcValidCol ? validCol : srcValidCol;
+  for (uint32_t r = 0; r < validRow; ++r) {
+    AscendC::Adds(dst[r * dstPhysCol], src, static_cast<T>(0),
+                  static_cast<int32_t>(cols));
+  }
+}
+
 // ---- reduce ----
 // The propagation pass emits this helper only for axis 0/-2: reduce down the
 // valid rows into out[0..validCol). The validated contract consumes no tmp and
@@ -1020,6 +1223,39 @@ gemm_v0(LocalTensor<T1> const &A, LocalTensor<T1> const &B,
   auto l0b = l0b_.Get<T1>();
   uint32_t kL0Tail = K - (kL0split - 1) * kL0Size;
   bool initflag = false;
+
+  // Mmad consumes K in whole C0 blocks: a tail mma with k = kL0Tail actually
+  // accumulates ceil(kL0Tail / ELE_NUM_PER_C0) * ELE_NUM_PER_C0 K-slots. The
+  // L1 zN layout only pads K up to a multiple of 16 rows, so for int8
+  // (ELE_NUM_PER_C0 == 32) a tail with kL0Tail % 32 in [1, 16] reads 16 L0B
+  // K-slots that neither the GM->L1 copy nor the L1->L0B copy ever wrote
+  // (stale L0B garbage -> silently wrong results). Reject that combination at
+  // compile time; 16/8-bit types never trip this (their C0 rounding never
+  // exceeds the 16-row fractal padding).
+  static_assert(
+      ELE_NUM_PER_C0 <= 16 ||
+          ((K - (kL0split - 1) * kL0Size) % ELE_NUM_PER_C0 == 0) ||
+          ((K - (kL0split - 1) * kL0Size) % ELE_NUM_PER_C0 > 16),
+      "gemm_v0: int8 K-tail must be 16-element aligned (kL0Tail % 32 in "
+      "[1,16] is unsupported: the mma consumes whole 32-element C0 blocks "
+      "but the L1 fractal layout only pads K to 16 rows, leaving L0B "
+      "K-slots unwritten). Split K differently or pad K to the needed "
+      "alignment.");
+
+  // The tail guard above is not enough: EVERY K-tile is consumed with a
+  // C0-rounded k (a full tile with kSize = kL0Size uses ceil(kL0Size/C0)*C0
+  // slots), and its L1->L0B source offset steps by ELE_NUM_PER_C0 * kL0Size.
+  // When kL0Size is not C0-aligned (e.g. int8 kL0Size = 48: mma consumes 64
+  // slots while the L1 zN layout only provides roundUp16(48) = 48 rows), the
+  // first tile already reads unwritten L0B slots and the tile offsets drift
+  // from the C0-rounded spans. Require kL0Size itself to be C0-aligned
+  // whenever the K axis is split at the L0 level.
+  static_assert(
+      ELE_NUM_PER_C0 <= 16 || kL0split == 1 || (kL0Size % ELE_NUM_PER_C0) == 0,
+      "gemm_v0: kL0Size must be a multiple of the C0 element count "
+      "(32 for int8) when K is split into multiple L0 tiles. A non-C0-aligned "
+      "kL0Size makes every mma consume more K-slots than the L1 fractal "
+      "layout provides and desynchronizes the L0 ping-pong bases.");
 
   // ---- N tiling -----------------------------------------------------------
   // The B operand tile loaded into L0B is (kL0Size x nTile); L0B holds 64KB,
@@ -1426,7 +1662,8 @@ Broadcast(const LocalTensor<T> &dst, const LocalTensor<T> &src,
                                                   sharedTmpBuffer);
 }
 
-template <typename T, int32_t dim, int32_t axis, bool isReuseSource = false>
+template <typename T, int32_t dim, int32_t axis, bool isReuseSource = false,
+          bool isSetMask = true>
 CATLASS_DEVICE void
 Broadcast(const LocalTensor<T> &dst, const LocalTensor<T> &src,
           const uint32_t dstShape[dim], const uint32_t srcShape[dim]) {
@@ -1437,14 +1674,25 @@ Broadcast(const LocalTensor<T> &dst, const LocalTensor<T> &src,
     srcSize *= srcShape[i];
   }
   if (srcSize == dstSize) {
-    AscendC::Muls(dst, src, static_cast<T>(1), dstSize);
+    if constexpr (isSetMask) {
+      AscendC::Muls(dst, src, static_cast<T>(1), dstSize);
+    } else {
+      AscendC::Muls<T, false>(dst, src, static_cast<T>(1),
+                              AscendC::MASK_PLACEHOLDER, 1,
+                              AscendC::UnaryRepeatParams());
+    }
     return;
   }
   ASCENDC_ASSERT((srcSize == 1), {
     KERNEL_LOG(KERNEL_ERROR,
                "Workspace-free Broadcast only supports equal or scalar shapes");
   });
-  AscendC::Duplicate(dst, src.GetValue(0), dstSize);
+  if constexpr (isSetMask) {
+    AscendC::Duplicate(dst, src.GetValue(0), dstSize);
+  } else {
+    AscendC::Duplicate<T, false>(dst, src.GetValue(0),
+                                 AscendC::MASK_PLACEHOLDER, 1, 1, 8);
+  }
 }
 
 template <typename T>
@@ -1714,7 +1962,7 @@ CATLASS_DEVICE void
 Fill_experiment(const LocalTensor<T> &dst, const T &scalarValue, uint64_t mask0,
                 const uint8_t repeatTime, const uint16_t dstBlockStride,
                 const uint8_t dstRepeatStride) {
-  uint64_t mask[1] = {mask0};
+  uint64_t mask[2] = {mask0, 0};
   AscendC::Duplicate(dst, scalarValue, mask, repeatTime, dstBlockStride,
                      dstRepeatStride);
 }

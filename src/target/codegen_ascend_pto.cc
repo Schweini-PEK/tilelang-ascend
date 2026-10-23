@@ -437,6 +437,29 @@ CodeGenTileLangAscendPto::GetCompareMaskInfo(const CallNode *dst_call,
   int32_t col = shape[1].as<IntImmNode>()->value;
   int32_t valid_col = shape[3].as<IntImmNode>()->value;
 
+  // Memory planning may reuse a wider tensor buffer for the packed uint8
+  // predicate.  In that case buffer_shapess_ describes the backing storage
+  // (for example [4, 64] half) rather than the logical mask ([4, 8] uint8).
+  // Recover the mask width from its access extent so PTO sees the same
+  // 32-byte-aligned row stride as it would for a standalone mask allocation.
+  const DataType access_dtype = dst_call->args[0].dtype();
+  const auto dtype_it = buffer_dtypes_.find(buffer_var.get());
+  const bool is_retyped =
+      dtype_it != buffer_dtypes_.end() && dtype_it->second != access_dtype;
+  if (is_retyped) {
+    const auto *extent_imm = dst_call->args[3].as<IntImmNode>();
+    row = src_info.row;
+    ICHECK_GT(row, 0);
+    if (extent_imm) {
+      ICHECK_EQ(extent_imm->value % row, 0)
+          << "Compare mask extent must be divisible by its row count";
+      valid_col = static_cast<int32_t>(extent_imm->value / row);
+    } else {
+      valid_col = (src_info.col + 7) / 8;
+    }
+    col = GetValidShape(valid_col, getType(access_dtype));
+  }
+
   int32_t slice_valid_row = src_info.slice_valid_row;
   int32_t slice_valid_col =
       std::min(valid_col, (src_info.slice_valid_col + 7) / 8);
@@ -917,8 +940,6 @@ void CodeGenTileLangAscendPto::VisitExpr_(const CallNode *op,
     BinaryVecOpsCodegen(op, "TMINS");
 
     // --- tail-aware vector ops (AscendTailMaskPropagation) ---
-    // Broadcast / compare / select stay on the full-tile path (gap filled with
-    // pad_value).
   } else if (op->op.same_as(tl::ascend_tail_unary())) {
     TailUnaryOpCodegen(op);
   } else if (op->op.same_as(tl::ascend_tail_binary())) {
@@ -927,6 +948,14 @@ void CodeGenTileLangAscendPto::VisitExpr_(const CallNode *op,
     TailScalarOpCodegen(op);
   } else if (op->op.same_as(tl::ascend_tail_reduce())) {
     TailReduceOpCodegen(op);
+  } else if (op->op.same_as(tl::ascend_tail_compare())) {
+    TailCompareOpCodegen(op, false);
+  } else if (op->op.same_as(tl::ascend_tail_compare_scalar())) {
+    TailCompareOpCodegen(op, true);
+  } else if (op->op.same_as(tl::ascend_tail_select())) {
+    TailSelectOpCodegen(op);
+  } else if (op->op.same_as(tl::ascend_tail_broadcast())) {
+    TailBroadcastOpCodegen(op);
 
     // --- sync / barrier ---
   } else if (op->op.same_as(tl::ascend_sync_all())) {
@@ -1073,7 +1102,11 @@ void CodeGenTileLangAscendPto::VisitExpr_(const CallNode *op,
     PrintType(op->dtype, this->stream);
     this->stream << " " << result << ";\n";
     this->PrintIndent();
-    this->stream << "if (" << cond << ") {\n";
+    if (cond[0] == '(' && cond[cond.length() - 1] == ')') {
+      this->stream << "if " << cond << " {\n";
+    } else {
+      this->stream << "if (" << cond << ") {\n";
+    }
     {
       int then_scope = this->BeginScope();
       std::string true_val = PrintExpr(op->args[1]);
@@ -3198,6 +3231,116 @@ void CodeGenTileLangAscendPto::TailReduceOpCodegen(const CallNode *op) {
   this->stream << op_name << "(" << dst << ", " << src << ");\n";
 }
 
+void CodeGenTileLangAscendPto::TailCompareOpCodegen(const CallNode *op,
+                                                    bool scalar) {
+  // args: dst(0) src0(1) src1/scalar(2) mode(3) validRow(4) validCol(5)
+  //       physRow(6) physCol(7) storageCol(8)
+  ICHECK_EQ(op->args.size(), 9U);
+  std::string valid_row = PrintExpr(op->args[4]);
+  std::string valid_col = PrintExpr(op->args[5]);
+  std::string packed_col = "((" + valid_col + " + 7) / 8)";
+  ShapeInfo src0_info = GetSliceInfo(op->args[1].as<CallNode>());
+  ShapeInfo mask_info =
+      GetCompareMaskInfo(op->args[0].as<CallNode>(), src0_info);
+  std::string dst = CreateUbVariableDynamic(mask_info, valid_row, packed_col);
+  std::string src0 = CreateUbVariableDynamic(src0_info, valid_row, valid_col);
+  std::string mode = Downcast<StringImm>(op->args[3])->value;
+
+  if (scalar) {
+    DataType src_dtype = GetAccessPtrDtypePto(op->args[1].as<CallNode>());
+    std::string scalar_value = PrintExpr(op->args[2]);
+    if (op->args[2].dtype() != src_dtype)
+      scalar_value = getType(src_dtype) + "(" + scalar_value + ")";
+    this->PrintIndent();
+    this->stream << kAscendPtoScope << "compare_scalar(" << dst << ", " << src0
+                 << ", " << scalar_value << ", CmpMode::" << mode << ");\n";
+  } else {
+    ShapeInfo src1_info = GetSliceInfo(op->args[2].as<CallNode>());
+    std::string src1 = CreateUbVariableDynamic(src1_info, valid_row, valid_col);
+    this->PrintIndent();
+    this->stream << kAscendPtoScope << "compare(" << dst << ", " << src0 << ", "
+                 << src1 << ", CmpMode::" << mode << ");\n";
+  }
+  this->PrintIndent();
+  this->stream << kAscendPtoScope << "clear_compare_tail_bits(" << dst << ", "
+               << valid_row << ", " << valid_col << ");\n";
+}
+
+void CodeGenTileLangAscendPto::TailSelectOpCodegen(const CallNode *op) {
+  // args: kind(0) dst(1) mask(2) src0(3) tmp(4) src1Type(5) src1(6)
+  //       mode(7) validRow(8) validCol(9) physRow(10) physCol(11)
+  //       storageCol(12)
+  ICHECK_EQ(op->args.size(), 13U);
+  std::string kind = Downcast<StringImm>(op->args[0])->value;
+  std::string valid_row = PrintExpr(op->args[8]);
+  std::string valid_col = PrintExpr(op->args[9]);
+  std::string packed_col = "((" + valid_col + " + 7) / 8)";
+  ShapeInfo dst_info = GetSliceInfo(op->args[1].as<CallNode>());
+  ShapeInfo src0_info = GetSliceInfo(op->args[3].as<CallNode>());
+  ShapeInfo mask_info =
+      GetCompareMaskInfo(op->args[2].as<CallNode>(), src0_info);
+  std::string dst = CreateUbVariableDynamic(dst_info, valid_row, valid_col);
+  std::string mask = CreateUbVariableDynamic(mask_info, valid_row, packed_col);
+  std::string src0 = CreateUbVariableDynamic(src0_info, valid_row, valid_col);
+  std::string tmp = PrintBufferOffset(op->args[4].as<CallNode>());
+  if (kind == "Tensor") {
+    ShapeInfo src1_info = GetSliceInfo(op->args[6].as<CallNode>());
+    std::string src1 = CreateUbVariableDynamic(src1_info, valid_row, valid_col);
+    this->PrintIndent();
+    this->stream << "TSEL(" << dst << ", " << mask << ", " << src0 << ", "
+                 << src1 << ", " << tmp << ");\n";
+  } else {
+    DataType dtype = GetAccessPtrDtypePto(op->args[3].as<CallNode>());
+    std::string scalar = PrintExpr(op->args[6]);
+    if (op->args[6].dtype() != dtype)
+      scalar = getType(dtype) + "(" + scalar + ")";
+    this->PrintIndent();
+    this->stream << "TSELS(" << dst << ", " << mask << ", " << src0 << ", "
+                 << tmp << ", " << scalar << ");\n";
+  }
+}
+
+void CodeGenTileLangAscendPto::TailBroadcastOpCodegen(const CallNode *op) {
+  // Original 2D broadcast args (with optional tmp), followed by four
+  // output/input valid-rectangle expressions.
+  ICHECK(op->args.size() == 12U || op->args.size() == 13U);
+  const bool has_tmp = op->args[3].as<CallNode>() != nullptr;
+  const size_t dim_index = has_tmp ? 4 : 3;
+  const size_t shape_index = dim_index + 1;
+  const size_t tail_index = op->args.size() - 4;
+  bool row_broadcast = is_one(op->args[shape_index + 3]);
+  ShapeInfo dst_info = GetSliceInfo(op->args[1].as<CallNode>());
+  ShapeInfo src_info = GetSliceInfo(op->args[2].as<CallNode>());
+  std::string valid_row = PrintExpr(op->args[tail_index]);
+  std::string valid_col = PrintExpr(op->args[tail_index + 1]);
+  std::string src_valid_row = PrintExpr(op->args[tail_index + 2]);
+  std::string src_valid_col = PrintExpr(op->args[tail_index + 3]);
+  std::string dst = CreateUbVariableDynamic(dst_info, valid_row, valid_col);
+  std::string src = GetTempVarName(src_info.ub_name);
+  this->PrintIndent();
+  if (row_broadcast) {
+    // A narrow GM->UB TLOAD places each logical source row in its own 32-byte
+    // block. Preserve that physical row pitch instead of reinterpreting the
+    // allocation as a packed DN column.
+    std::string src_rows = PrintExpr(op->args[shape_index + 2]);
+    this->stream << kAscendPtoScope << "TileUbDataND<" << src_info.type << ", "
+                 << src_rows << ", " << src_info.col << ", pto::DYNAMIC, 1> "
+                 << src << "(" << src_valid_row << ");\n";
+  } else {
+    this->stream << kAscendPtoScope << "TileUbDataND<" << src_info.type << ", "
+                 << src_info.row << ", " << src_info.col
+                 << ", 1, pto::DYNAMIC> " << src << "(" << src_valid_col
+                 << ");\n";
+  }
+  this->PrintIndent();
+  this->stream << "TASSIGN(" << src << ", " << src_info.first_addr << " + "
+               << src_info.offset << " * " << GetTypeLen(src_info.type)
+               << ");\n";
+  this->PrintIndent();
+  this->stream << (row_broadcast ? "TROWEXPAND(" : "TCOLEXPAND(") << dst << ", "
+               << src << ");\n";
+}
+
 void CodeGenTileLangAscendPto::ScalarOpCodegen(const CallNode *op,
                                                const std::string &op_name) {
   ShapeInfo src_shape_info = GetSliceInfo(op->args[1].as<CallNode>());
@@ -3554,6 +3697,94 @@ void CodeGenTileLangAscendPto::CodegenRowReduce(const ReduceOpInfo &op_info,
     CreateUbVariableND(temp_name, tmp_cast);
   }
 
+  // A float16 sum reduces natively in f16 precision (TROWSUM on half tiles),
+  // which shows a visible accumulation error on random data (issue #754).
+  // Widen to float32 instead -- TCVT -> TROWSUM<float> -> TCVT -- so the
+  // reduction accumulates in float32 and rounds once at the end. The widened
+  // source, the TROWSUM scratch and the float32 partial destination are
+  // views over the injected workspace; its sizing rule covers the float32
+  // layout for half inputs (EstimatePTOReduceWorkspaceBytes).
+  if (op_info.kind == ReduceKind::SUM && src.type == "half") {
+    const int32_t rows = src.slice_valid_row;
+    const int32_t cols = src.slice_valid_col;
+
+    // PTO tiles require the contiguous dimension to be 32-byte aligned:
+    // a row-major (ND) tile aligns its column count, a column-major (DN)
+    // tile its row count. The widened source therefore keeps the logical
+    // column count only in its valid shape and pads the physical one.
+    const int32_t src_phys_cols = GetValidShape(cols, "float");
+    const int32_t src_f32_elems = rows * src_phys_cols;
+    // TROWSUM scratch: same sizing rule as the native path, in float32
+    // (already 32-byte aligned by GetRowReduceTmpCol).
+    const int32_t tmp_f32_cols = GetRowReduceTmpCol(cols, "float");
+    const int32_t tmp_f32_elems = rows * tmp_f32_cols;
+    // The DN destination carries the row count in the DN template's Cols
+    // slot, so the physical row count must itself stay 32-byte aligned.
+    const int32_t dst_phys_rows = GetValidShape(rows, "float");
+    // Workspace layout (float32 elements): [source | scratch | destination].
+    const int32_t dst_f32_off = src_f32_elems + tmp_f32_elems;
+
+    // Reinterpret the byte-typed workspace as float32; ReinterpretShapeInfo
+    // converts both the extent and the offset to float32 element units.
+    ShapeInfo ws = ReinterpretShapeInfo(tmp, "float");
+    std::string f32_src_name = GetTempVarName(tmp.ub_name + "_f32_src");
+    std::string f32_scratch_name = GetTempVarName(tmp.ub_name + "_f32_scratch");
+    std::string f32_dst_name = GetTempVarName(tmp.ub_name + "_f32_dst");
+
+    auto emit_subtile = [&](const std::string &name, int32_t off, int32_t nrows,
+                            int32_t phys_cols, int32_t valid_cols,
+                            bool is_dst = false) {
+      ShapeInfo view = ws;
+      view.ub_name = name;
+      view.row = nrows;
+      view.col = phys_cols;
+      view.slice_row = nrows;
+      view.slice_col = phys_cols;
+      view.slice_valid_row = nrows;
+      view.slice_valid_col = valid_cols;
+      view.is_slice = false;
+      if (off != 0) {
+        view.offset = "(" + ws.offset + " + " + std::to_string(off) + ")";
+      }
+      if (is_dst) {
+        // TROWSUM writes a DN (column-major) destination: ShapeInfo keeps
+        // row=1 x col=phys_rows so the emitted DN template carries the row
+        // count in its Cols slot, matching the native float32 row-reduce
+        // layout. The valid row count stays logical.
+        CreateUbVariableDN(name, view);
+      } else {
+        CreateUbVariableND(name, view);
+      }
+    };
+
+    emit_subtile(f32_src_name, 0, rows, src_phys_cols, cols);
+    emit_subtile(f32_scratch_name, src_f32_elems, rows, tmp_f32_cols,
+                 tmp_f32_cols);
+    emit_subtile(f32_dst_name, dst_f32_off, 1, dst_phys_rows, rows, true);
+
+    this->PrintIndent();
+    this->stream << "TCVT(" << f32_src_name << ", " << src_name
+                 << ", RoundMode::CAST_NONE);\n";
+    this->PrintIndent();
+    this->stream << "TROWSUM(" << f32_dst_name << ", " << f32_src_name << ", "
+                 << f32_scratch_name << ");\n";
+    // The final narrow cast reads the DN float32 destination; writing into
+    // a row-major (ND) half tile keeps both TCVT operands on supported
+    // same-layout combinations (a DN-to-DN TCVT is not a verified path).
+    // A sliced or synthetic destination (clear=False tmp output) has no
+    // predeclared tile of its own, so declare an offset-carrying ND view
+    // and narrow into that instead of the backing-buffer start.
+    std::string narrow_dst_name = dst.ub_name;
+    if (dst.is_slice) {
+      narrow_dst_name = GetTempVarName(dst.ub_name + "_narrow");
+      CreateUbVariableND(narrow_dst_name, dst);
+    }
+    this->PrintIndent();
+    this->stream << "TCVT(" << narrow_dst_name << ", " << f32_dst_name
+                 << ", RoundMode::CAST_RINT);\n";
+    return;
+  }
+
   this->PrintIndent();
   this->stream << op_name << "(" << dst_name << ", " << src_name << ", "
                << temp_name << ");\n";
@@ -3561,7 +3792,9 @@ void CodeGenTileLangAscendPto::CodegenRowReduce(const ReduceOpInfo &op_info,
 
 void CodeGenTileLangAscendPto::CodegenColReduce(const ReduceOpInfo &op_info,
                                                 const ShapeInfo &dst,
-                                                const ShapeInfo &src) {
+                                                const ShapeInfo &src,
+                                                const ShapeInfo &tmp,
+                                                bool has_tmp) {
   std::string op_name = GetReduceOpName(op_info.kind, ReduceDirection::COL);
 
   std::string dst_name = dst.ub_name;
@@ -3575,6 +3808,68 @@ void CodeGenTileLangAscendPto::CodegenColReduce(const ReduceOpInfo &op_info,
   if (src.is_slice) {
     src_name = GetTempVarName(src.ub_name);
     CreateUbVariableND(src_name, src);
+  }
+
+  // A float16 column sum reduces natively in f16 precision (TCOLSUM on half
+  // tiles), which shows a visible accumulation error on random data (issue
+  // #754). Widen to float32 instead -- TCVT -> TCOLSUM<float> -> TCVT --
+  // with the widened source and the float32 partial destination as views
+  // over an injected workspace.
+  if (op_info.kind == ReduceKind::SUM && src.type == "half") {
+    ICHECK(has_tmp) << "PTO float16 column reduce_sum expects an injected "
+                       "workspace for the float32 widening";
+    const int32_t rows = src.slice_valid_row;
+    const int32_t cols = src.slice_valid_col;
+
+    // PTO tiles require the contiguous dimension to be 32-byte aligned, so
+    // the widened source pads its physical column count and keeps the
+    // logical count in the valid shape only.
+    const int32_t src_phys_cols = GetValidShape(cols, "float");
+    const int32_t src_f32_elems = rows * src_phys_cols;
+    // TCOLSUM writes a row-major destination whose column count must stay
+    // 32-byte aligned in float32.
+    const int32_t dst_f32_cols = GetValidShape(cols, "float");
+
+    ShapeInfo ws = ReinterpretShapeInfo(tmp, "float");
+    std::string f32_src_name = GetTempVarName(tmp.ub_name + "_f32_src");
+    std::string f32_dst_name = GetTempVarName(tmp.ub_name + "_f32_dst");
+
+    auto emit_col_subtile = [&](const std::string &name, int32_t off,
+                                int32_t nrows, int32_t phys_cols,
+                                int32_t valid_cols) {
+      ShapeInfo view = ws;
+      view.ub_name = name;
+      view.row = nrows;
+      view.col = phys_cols;
+      view.slice_row = nrows;
+      view.slice_col = phys_cols;
+      view.slice_valid_row = nrows;
+      view.slice_valid_col = valid_cols;
+      view.is_slice = false;
+      if (off != 0) {
+        view.offset = "(" + ws.offset + " + " + std::to_string(off) + ")";
+      }
+      CreateUbVariableND(name, view);
+    };
+
+    emit_col_subtile(f32_src_name, 0, rows, src_phys_cols, cols);
+    emit_col_subtile(f32_dst_name, src_f32_elems, 1, dst_f32_cols, cols);
+
+    this->PrintIndent();
+    this->stream << "TCVT(" << f32_src_name << ", " << src_name
+                 << ", RoundMode::CAST_NONE);\n";
+    this->PrintIndent();
+    this->stream << "TCOLSUM(" << f32_dst_name << ", " << f32_src_name
+                 << ");\n";
+    // The narrow cast reads the row-major float32 destination into the ND
+    // half tile; a DN-to-DN TCVT is not a verified path. A sliced or
+    // synthetic destination (clear=False tmp output) has no predeclared
+    // tile, but the slice view declared above (dst_name) carries its
+    // offset, so narrow into that.
+    this->PrintIndent();
+    this->stream << "TCVT(" << dst_name << ", " << f32_dst_name
+                 << ", RoundMode::CAST_RINT);\n";
+    return;
   }
 
   this->PrintIndent();
@@ -3642,6 +3937,12 @@ void CodeGenTileLangAscendPto::ReduceOpCodegen(const CallNode *op) {
     std::string reduce_dst_name = GetTempVarName(reduce_dst.ub_name);
     CreateUbVariableND(reduce_dst_name, reduce_dst);
 
+    // The merge reads what the reduce just wrote into the tmp output view.
+    // A same-pipe V dependency is not ordered on its own (the native paths
+    // only worked by accident through barriers buried inside TROWSUM), so
+    // fence the pipe before the merge instruction reads the view.
+    this->PrintIndent();
+    this->stream << "pipe_barrier(PIPE_V);\n";
     this->PrintIndent();
     this->stream << GetReduceMergeOpName(op_info.kind) << "(" << dst_name
                  << ", " << dst_name << ", " << reduce_dst_name << ");\n";
@@ -3664,7 +3965,12 @@ void CodeGenTileLangAscendPto::ReduceOpCodegen(const CallNode *op) {
 
   if (!clear) {
     const bool is_row = op_info.direction == ReduceDirection::ROW;
-    const int output_tmp_index = is_row ? 4 : 3;
+    // tmp operand layout: [main tmp?] [output tmp]. A row reduce always
+    // carries a main tmp (TROWSUM scratch), and a float16 column sum has
+    // one injected for the float32 widening as well, so the output view
+    // only sits at args[3] when no main view precedes it.
+    const size_t tmp_count = clear_idx - 3;
+    const size_t output_tmp_index = tmp_count >= 2 ? 4 : 3;
     ICHECK_GT(clear_idx, output_tmp_index)
         << "PTO reduce(clear=False) expects an injected temporary output "
            "buffer.";
@@ -3676,8 +3982,13 @@ void CodeGenTileLangAscendPto::ReduceOpCodegen(const CallNode *op) {
           << "PTO row reduce expects a main tmp buffer.";
       ShapeInfo tmp = GetSliceInfo(op->args[3].as<CallNode>());
       CodegenRowReduce(op_info, tmp_dst, src, tmp);
+    } else if (tmp_count >= 2) {
+      // A float16 column sum: args[3] is the widening main workspace and
+      // args[4] the clear=False output view.
+      ShapeInfo main_tmp = GetSliceInfo(op->args[3].as<CallNode>());
+      CodegenColReduce(op_info, tmp_dst, src, main_tmp, true);
     } else {
-      CodegenColReduce(op_info, tmp_dst, src);
+      CodegenColReduce(op_info, tmp_dst, src, src, false);
     }
     emit_merge(tmp_dst);
     return;
@@ -3694,7 +4005,16 @@ void CodeGenTileLangAscendPto::ReduceOpCodegen(const CallNode *op) {
     if (is_slice) {
       dst.slice_valid_col = op_info.buffer_slice_col;
     }
-    CodegenColReduce(op_info, dst, src);
+    // A float16 column sum has an injected workspace (float32 widening);
+    // every other column reduce is workspace-free.
+    const bool col_has_tmp =
+        (clear_idx > 3) && op->args[3].as<CallNode>() &&
+        op->args[3].as<CallNode>()->op.same_as(builtin::tvm_access_ptr());
+    ShapeInfo col_tmp = src;
+    if (col_has_tmp) {
+      col_tmp = GetSliceInfo(op->args[3].as<CallNode>());
+    }
+    CodegenColReduce(op_info, dst, src, col_tmp, col_has_tmp);
   }
 }
 
