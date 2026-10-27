@@ -81,12 +81,26 @@ def group_norm_kernel_expert(
     use_fp32 = dtype in ["float16", "bfloat16"]
     cal_dtype = "float32" if use_fp32 else dtype
 
+    # Exact-shape output contract (cann-bench): y is declared with the REAL
+    # S, so only the valid columns of the last s-block are written and the
+    # host never needs a strided slice/copy (which is both non-contiguous
+    # and an aclnn call the wrapper must not make).
+    tail_len = S - (s_num - 1) * block_S
+    has_tail = tail_len < block_S  # last s-block is partial
+    # MTE narrows the src row pitch of a T.copy region to
+    # ceil(width*elem, 32B).  A [cpg, tail] copy from the block_S-pitched DB
+    # buffer is therefore only correct when the quantized pitch equals the
+    # buffer pitch, i.e. (block_S - tail)*elem < 32; otherwise the tail is
+    # written row-by-row with 1D copies (the validated 1D->1D pattern).
+    elem_bytes = 2 if dtype in ("float16", "bfloat16") else 4
+    tail_2d_ok = (block_S - tail_len) * elem_bytes < 32
+
     @T.prim_func
     def main(
         x: T.Tensor((N, G, cpg, S), dtype),  # type: ignore
         gamma: T.Tensor((G, cpg), dtype),  # type: ignore
         beta: T.Tensor((G, cpg), dtype),  # type: ignore
-        y: T.Tensor((N, G, cpg, S_padded), dtype),  # type: ignore
+        y: T.Tensor((N * G * cpg, S), dtype),  # type: ignore  (2D row-major view of (N, G, cpg, S))
     ):
         with T.Kernel(block_num, is_npu=True) as (cid, vid):
             ng = cid // split_factor
@@ -199,7 +213,7 @@ def group_norm_kernel_expert(
                             T.set_flag("v", "mte3", cur)
                             s_off_cur = (si - 1) * block_S
                             T.wait_flag("v", "mte3", cur)
-                            T.copy(out_buf_db[cur, :, :], y[n, g, 0:cpg, s_off_cur : s_off_cur + block_S])
+                            T.copy(out_buf_db[cur, :, :], y[ng * cpg : ng * cpg + cpg, s_off_cur : s_off_cur + block_S])
                             T.set_flag("mte3", "mte2", cur)
 
                         last_cur = (s_num_v0 - 1) % 2
@@ -217,7 +231,15 @@ def group_norm_kernel_expert(
                             T.copy(data_cal, out_buf_db[last_cur, :, :])
                         T.set_flag("v", "mte3", last_cur)
                         T.wait_flag("v", "mte3", last_cur)
-                        T.copy(out_buf_db[last_cur, :, :], y[n, g, 0:cpg, s_off_last : s_off_last + block_S])
+                        if split_factor == 1 and has_tail:
+                            # this half owns the global last s-block: partial write
+                            if tail_2d_ok:
+                                T.copy(out_buf_db[last_cur, :, :tail_len], y[ng * cpg : ng * cpg + cpg, s_off_last : s_off_last + tail_len])
+                            else:
+                                for r in T.serial(cpg):
+                                    T.copy(out_buf_db[last_cur, r, 0:tail_len], y[ng * cpg + r, s_off_last : s_off_last + tail_len])
+                        else:
+                            T.copy(out_buf_db[last_cur, :, :], y[ng * cpg : ng * cpg + cpg, s_off_last : s_off_last + block_S])
                         T.set_flag("mte3", "mte2", last_cur)
                         T.wait_flag("mte3", "mte2", 0)
                         T.wait_flag("mte3", "mte2", 1)
@@ -250,7 +272,7 @@ def group_norm_kernel_expert(
                             T.set_flag("v", "mte3", cur)
                             s_off_cur = (si - 1 + s_num_v0) * block_S
                             T.wait_flag("v", "mte3", cur)
-                            T.copy(out_buf_db[cur, :, :], y[n, g, 0:cpg, s_off_cur : s_off_cur + block_S])
+                            T.copy(out_buf_db[cur, :, :], y[ng * cpg : ng * cpg + cpg, s_off_cur : s_off_cur + block_S])
                             T.set_flag("mte3", "mte2", cur)
 
                         last_cur = (s_num_v1 - 1) % 2
@@ -268,7 +290,15 @@ def group_norm_kernel_expert(
                             T.copy(data_cal, out_buf_db[last_cur, :, :])
                         T.set_flag("v", "mte3", last_cur)
                         T.wait_flag("v", "mte3", last_cur)
-                        T.copy(out_buf_db[last_cur, :, :], y[n, g, 0:cpg, s_off_last : s_off_last + block_S])
+                        if s_num_v1 > 0 and has_tail:
+                            # this half owns the global last s-block: partial write
+                            if tail_2d_ok:
+                                T.copy(out_buf_db[last_cur, :, :tail_len], y[ng * cpg : ng * cpg + cpg, s_off_last : s_off_last + tail_len])
+                            else:
+                                for r in T.serial(cpg):
+                                    T.copy(out_buf_db[last_cur, r, 0:tail_len], y[ng * cpg + r, s_off_last : s_off_last + tail_len])
+                        else:
+                            T.copy(out_buf_db[last_cur, :, :], y[ng * cpg : ng * cpg + cpg, s_off_last : s_off_last + block_S])
                         T.set_flag("mte3", "mte2", last_cur)
                         T.wait_flag("mte3", "mte2", 0)
                         T.wait_flag("mte3", "mte2", 1)
@@ -290,7 +320,15 @@ def group_norm_kernel_expert(
                             else:
                                 T.copy(data_cal, out_buf_db[0, :, :])
                             T.barrier_all()
-                            T.copy(out_buf_db[0, :, :], y[n, g, 0:cpg, s_off : s_off + block_S])
+                            if has_tail and actual_si == s_num - 1:
+                                # global last s-block: partial write
+                                if tail_2d_ok:
+                                    T.copy(out_buf_db[0, :, :tail_len], y[ng * cpg : ng * cpg + cpg, s_off : s_off + tail_len])
+                                else:
+                                    for r in T.serial(cpg):
+                                        T.copy(out_buf_db[0, r, 0:tail_len], y[ng * cpg + r, s_off : s_off + tail_len])
+                            else:
+                                T.copy(out_buf_db[0, :, :], y[ng * cpg : ng * cpg + cpg, s_off : s_off + block_S])
 
     return main
 
@@ -313,7 +351,7 @@ def group_norm_kernel_2d(
         x: T.Tensor((N, G, cpg), dtype),  # type: ignore
         gamma: T.Tensor((G, cpg), dtype),  # type: ignore
         beta: T.Tensor((G, cpg), dtype),  # type: ignore
-        y: T.Tensor((N, G, cpg_padded), dtype),  # type: ignore
+        y: T.Tensor((N * G, cpg), dtype),  # type: ignore  (2D row-major view of (N, G, cpg))
     ):
         with T.Kernel(block_num, is_npu=True) as (cid, vid):
             n = cid // G
@@ -368,7 +406,7 @@ def group_norm_kernel_2d(
                     T.tile.cast(data_1d, data_cal, CAST_HIGH2LOW, cpg_padded)
                 else:
                     T.copy(data_cal, data_1d)
-                T.copy(data_1d, y[n, g, 0:cpg_padded])
+                T.copy(data_1d[0:cpg], y[cid, 0:cpg])
 
     return main
 
@@ -443,8 +481,6 @@ def group_norm(x, gamma, beta, num_groups, epsilon=1e-5):
         beta_2d = beta.reshape(num_groups, cpg)
         func = _get_kernel_2d(N, num_groups, cpg, cpg_padded, epsilon, dtype_str)
         y_3d = func(x_3d, gamma_2d, beta_2d)
-        if cpg_padded > cpg:
-            y_3d = y_3d[:, :, :cpg].contiguous()
         return y_3d.reshape(original_shape)
 
     block_S = _find_block_S(S, cpg, dtype_str)
@@ -484,8 +520,6 @@ def group_norm(x, gamma, beta, num_groups, epsilon=1e-5):
     )
     y_4d = func(x_4d, gamma_2d, beta_2d)
 
-    if S_padded > S:
-        y_4d = y_4d[:, :, :, :S].contiguous()
     return y_4d.reshape(original_shape)
 
 
