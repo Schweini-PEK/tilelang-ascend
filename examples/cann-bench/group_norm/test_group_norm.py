@@ -147,6 +147,9 @@ def _run_case(name, shape, dtype, num_groups, eps, value_range, level="l0"):
     beta = torch.randn(C, dtype=_DTYPE_MAP[dtype_str]).npu()
 
     y = group_norm(x, gamma, beta, num_groups, eps)
+    # cann-bench contract: the operator must return a contiguous tensor
+    # (view/transpose/expand-style metadata wrapping of padded output is rejected)
+    assert y.is_contiguous(), f"{level} {name}: output is non-contiguous (strides {y.stride()}, shape {tuple(y.shape)})"
     ref = golden_group_norm(x.cpu().float(), gamma.cpu().float(), beta.cpu().float(), num_groups, eps).to(_DTYPE_MAP[dtype_str])
 
     if level in ("l0", "l1"):

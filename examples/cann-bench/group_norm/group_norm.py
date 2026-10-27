@@ -444,7 +444,7 @@ def group_norm(x, gamma, beta, num_groups, epsilon=1e-5):
         func = _get_kernel_2d(N, num_groups, cpg, cpg_padded, epsilon, dtype_str)
         y_3d = func(x_3d, gamma_2d, beta_2d)
         if cpg_padded > cpg:
-            y_3d = y_3d[:, :, :cpg]
+            y_3d = y_3d[:, :, :cpg].contiguous()
         return y_3d.reshape(original_shape)
 
     block_S = _find_block_S(S, cpg, dtype_str)
@@ -485,7 +485,7 @@ def group_norm(x, gamma, beta, num_groups, epsilon=1e-5):
     y_4d = func(x_4d, gamma_2d, beta_2d)
 
     if S_padded > S:
-        y_4d = y_4d[:, :, :, :S]
+        y_4d = y_4d[:, :, :, :S].contiguous()
     return y_4d.reshape(original_shape)
 
 
