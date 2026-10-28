@@ -93,15 +93,13 @@ def group_norm_kernel_expert(
     # buffer is therefore only correct when the quantized pitch equals the
     # buffer pitch, i.e. (block_S - tail)*elem < 32; otherwise the tail is
     # written row-by-row with 1D copies (the validated 1D->1D pattern).
-    elem_bytes = 2 if dtype in ("float16", "bfloat16") else 4
-    tail_2d_ok = (block_S - tail_len) * elem_bytes < 32
 
     @T.prim_func
     def main(
         x: T.Tensor((N, G, cpg, S), dtype),  # type: ignore
         gamma: T.Tensor((G, cpg), dtype),  # type: ignore
         beta: T.Tensor((G, cpg), dtype),  # type: ignore
-        y: T.Tensor((N * G * cpg, S), dtype),  # type: ignore  (2D row-major view of (N, G, cpg, S))
+        y: T.Tensor((N, G, cpg, S), dtype),  # type: ignore  (exact S, no padding)
     ):
         with T.Kernel(block_num, is_npu=True) as (cid, vid):
             ng = cid // split_factor
@@ -214,7 +212,7 @@ def group_norm_kernel_expert(
                             T.set_flag("v", "mte3", cur)
                             s_off_cur = (si - 1) * block_S
                             T.wait_flag("v", "mte3", cur)
-                            T.copy(out_buf_db[cur, :, :], y[ng * cpg : ng * cpg + cpg, s_off_cur : s_off_cur + block_S])
+                            T.copy(out_buf_db[cur, :, :], y[n, g, 0:cpg, s_off_cur : s_off_cur + block_S])
                             T.set_flag("mte3", "mte2", cur)
 
                         last_cur = (s_num_v0 - 1) % 2
@@ -234,13 +232,13 @@ def group_norm_kernel_expert(
                         T.wait_flag("v", "mte3", last_cur)
                         if split_factor == 1 and has_tail:
                             # this half owns the global last s-block: partial write
-                            if tail_2d_ok:
-                                T.copy(out_buf_db[last_cur, :, :tail_len], y[ng * cpg : ng * cpg + cpg, s_off_last : s_off_last + tail_len])
-                            else:
-                                for r in T.serial(cpg):
-                                    T.copy(out_buf_db[last_cur, r, 0:tail_len], y[ng * cpg + r, s_off_last : s_off_last + tail_len])
+                            # (always per-row 1D — CANN 9.1 safe; the MTE 2D
+                            # partial-width copy's row-pitch quantization is only
+                            # verified on CANN 9.2)
+                            for r in T.serial(cpg):
+                                T.copy(out_buf_db[last_cur, r, 0:tail_len], y[n, g, r, s_off_last : s_off_last + tail_len])
                         else:
-                            T.copy(out_buf_db[last_cur, :, :], y[ng * cpg : ng * cpg + cpg, s_off_last : s_off_last + block_S])
+                            T.copy(out_buf_db[last_cur, :, :], y[n, g, 0:cpg, s_off_last : s_off_last + block_S])
                         T.set_flag("mte3", "mte2", last_cur)
                         T.wait_flag("mte3", "mte2", 0)
                         T.wait_flag("mte3", "mte2", 1)
@@ -273,7 +271,7 @@ def group_norm_kernel_expert(
                             T.set_flag("v", "mte3", cur)
                             s_off_cur = (si - 1 + s_num_v0) * block_S
                             T.wait_flag("v", "mte3", cur)
-                            T.copy(out_buf_db[cur, :, :], y[ng * cpg : ng * cpg + cpg, s_off_cur : s_off_cur + block_S])
+                            T.copy(out_buf_db[cur, :, :], y[n, g, 0:cpg, s_off_cur : s_off_cur + block_S])
                             T.set_flag("mte3", "mte2", cur)
 
                         last_cur = (s_num_v1 - 1) % 2
@@ -293,13 +291,11 @@ def group_norm_kernel_expert(
                         T.wait_flag("v", "mte3", last_cur)
                         if s_num_v1 > 0 and has_tail:
                             # this half owns the global last s-block: partial write
-                            if tail_2d_ok:
-                                T.copy(out_buf_db[last_cur, :, :tail_len], y[ng * cpg : ng * cpg + cpg, s_off_last : s_off_last + tail_len])
-                            else:
-                                for r in T.serial(cpg):
-                                    T.copy(out_buf_db[last_cur, r, 0:tail_len], y[ng * cpg + r, s_off_last : s_off_last + tail_len])
+                            # (always per-row 1D — CANN 9.1 safe)
+                            for r in T.serial(cpg):
+                                T.copy(out_buf_db[last_cur, r, 0:tail_len], y[n, g, r, s_off_last : s_off_last + tail_len])
                         else:
-                            T.copy(out_buf_db[last_cur, :, :], y[ng * cpg : ng * cpg + cpg, s_off_last : s_off_last + block_S])
+                            T.copy(out_buf_db[last_cur, :, :], y[n, g, 0:cpg, s_off_last : s_off_last + block_S])
                         T.set_flag("mte3", "mte2", last_cur)
                         T.wait_flag("mte3", "mte2", 0)
                         T.wait_flag("mte3", "mte2", 1)
@@ -323,13 +319,11 @@ def group_norm_kernel_expert(
                             T.barrier_all()
                             if has_tail and actual_si == s_num - 1:
                                 # global last s-block: partial write
-                                if tail_2d_ok:
-                                    T.copy(out_buf_db[0, :, :tail_len], y[ng * cpg : ng * cpg + cpg, s_off : s_off + tail_len])
-                                else:
-                                    for r in T.serial(cpg):
-                                        T.copy(out_buf_db[0, r, 0:tail_len], y[ng * cpg + r, s_off : s_off + tail_len])
+                                # (always per-row 1D — CANN 9.1 safe)
+                                for r in T.serial(cpg):
+                                    T.copy(out_buf_db[0, r, 0:tail_len], y[n, g, r, s_off : s_off + tail_len])
                             else:
-                                T.copy(out_buf_db[0, :, :], y[ng * cpg : ng * cpg + cpg, s_off : s_off + block_S])
+                                T.copy(out_buf_db[0, :, :], y[n, g, 0:cpg, s_off : s_off + block_S])
 
     return main
 
@@ -535,6 +529,15 @@ def _find_block_S(S, cpg, dtype_str, split3=False):
     max_block_S = min(max(max_block_S, 16), 1024)
     for bs in range(max_block_S, 0, -16):
         if S % bs == 0:
+            return bs
+    # no exact divisor — prefer a block_S whose tail keeps the MTE row
+    # pitch quantization safe ((block_S - tail)*elem < 32), so the 2D
+    # partial write stays a single burst instead of falling back to
+    # cpg serial 1D copies (the hidden-set regression hot spot)
+    elem_bytes = 2 if dtype_str in ("float16", "bfloat16") else 4
+    for bs in range(max_block_S, 0, -16):
+        tail = S % bs
+        if tail != 0 and (bs - tail) * elem_bytes < 32:
             return bs
     return max_block_S
 
