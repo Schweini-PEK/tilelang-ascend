@@ -612,14 +612,11 @@ def group_norm(x, gamma, beta, num_groups, epsilon=1e-5):
     cpg = C // num_groups
 
     if x.ndim == 2:
-        if num_groups == 1:
-            # row-tiled fast path: block_M rows per block (row dim is the
-            # contiguous GM dim of a 2D input)
-            cpg_pad = max(((cpg + 15) // 16) * 16, 16)
-            block_M = _find_block_m_2d(cpg, dtype_str)
-            func = _get_kernel_2d_tiled(N, cpg, cpg_pad, block_M, epsilon, dtype_str)
-            y_pad = func(x, gamma, beta)  # (R_pad, cpg); padded tail rows
-            return y_pad[:N].reshape(original_shape)
+        # NOTE: a row-tiled fast path (block_M rows per block for G==1,
+        # cb13 134->11us on CANN 9.2) is disabled — its [ROWS, cpg_pad]
+        # broadcast chain lowers incorrectly on CANN 9.1 (the CI runner,
+        # verified by the 93% mismatch on the (1023,257) smoke case).
+        # All 2D inputs go through the battle-tested per-row kernel.
         cpg_padded = max(((cpg + 7) // 8) * 8, 8)
         x_3d = x.reshape(N, num_groups, cpg)
         gamma_2d = gamma.reshape(num_groups, cpg)
